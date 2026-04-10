@@ -1,0 +1,246 @@
+# -----------------------------------------------------------------------------
+# Virtual environments
+# -----------------------------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+.envs/
+
+# uv (https://docs.astral.sh/uv/)
+.uv/
+
+# -----------------------------------------------------------------------------
+# Secrets and local env (track .env.example as a template only)
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# -----------------------------------------------------------------------------
+# SSL / CA bundles (machine-specific; see scripts/Configure-PythonSSL.ps1)
+# -----------------------------------------------------------------------------
+ssl/cacert-combined.pem
+ssl/*.pem
+!ssl/.gitkeep
+
+# -----------------------------------------------------------------------------
+# Datasets, weights, archives (large / reproducible or downloaded)
+# -----------------------------------------------------------------------------
+# Root-level data dirs only (avoid ignoring a Python package named `data` elsewhere)
+/data/
+/datasets/
+/raw/
+/downloads/
+
+# Caches created inside the repo (HF, pip, torch hubs, etc.)
+**/.cache/
+
+# Weight and export formats
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.engine
+*.plan
+*.trt
+*.mlmodel
+*.tflite
+*.h5
+*.pb
+
+# Archives (datasets, releases)
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+
+# BoxMOT / TrackEval data trees populated after download
+boxmot/engine/trackeval/data/
+
+# -----------------------------------------------------------------------------
+# Experiments and run outputs
+# -----------------------------------------------------------------------------
+runs/
+**/runs/
+wandb/
+mlruns/
+lightning_logs/
+tensorboard/
+**/events.out.tfevents.*
+outputs/
+experiments/
+benchmark_results/
+
+# -----------------------------------------------------------------------------
+# Python
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+pip-wheel-metadata/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-log.txt
+pip-delete-this-directory.txt
+*.manifest
+*.spec
+
+# Testing / typing / linters
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+cython_debug/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+*.py,cover
+htmlcov/
+.tox/
+.nox/
+nosetests.xml
+test-results/
+junit/
+
+# Translations
+*.mo
+*.pot
+
+# Sphinx / docs builds
+docs/_build/
+site/
+
+# PyBuilder
+target/
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath
+*.sage.py
+
+# Spyder
+.spyderproject
+.spyproject
+
+# Rope
+.ropeproject
+
+# mkdocs
+/site
+
+# pyenv
+.python-version
+
+# pipenv (optional: remove Pipfile.lock from ignore if you pin deps for apps)
+# Pipfile.lock
+
+# PEP 582
+__pypackages__/
+
+# -----------------------------------------------------------------------------
+# Jupyter
+# -----------------------------------------------------------------------------
+.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+# -----------------------------------------------------------------------------
+# PyCharm / IntelliJ
+# -----------------------------------------------------------------------------
+.idea/
+*.iml
+out/
+
+# -----------------------------------------------------------------------------
+# Visual Studio Code — ignore local overrides; commit shared JSON if present
+# -----------------------------------------------------------------------------
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/*.code-snippets
+
+# -----------------------------------------------------------------------------
+# Cursor — local state; allow shared rules
+# -----------------------------------------------------------------------------
+.cursor/*
+!.cursor/rules/
+
+# -----------------------------------------------------------------------------
+# Other editors
+# -----------------------------------------------------------------------------
+*.swp
+*.swo
+*~
+.project
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# -----------------------------------------------------------------------------
+# OS
+# -----------------------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+.fuse_hidden*
+.directory
+.Trash-*
+
+# -----------------------------------------------------------------------------
+# Logs and temp
+# -----------------------------------------------------------------------------
+*.log
+*.log.*
+logs/
+tmp/
+temp/
+.tmp/
+*.tmp
+*.temp
+*.bak
+
+# -----------------------------------------------------------------------------
+# Profiling
+# -----------------------------------------------------------------------------
+*.prof
+*.pstats

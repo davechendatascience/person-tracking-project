@@ -1,91 +1,17 @@
-# -----------------------------------------------------------------------------
-# Virtual environments
-# -----------------------------------------------------------------------------
-.venv/
-venv/
-env/
-ENV/
-.envs/
-
-# uv (https://docs.astral.sh/uv/)
-.uv/
-
-# -----------------------------------------------------------------------------
-# Secrets and local env (track .env.example as a template only)
-# -----------------------------------------------------------------------------
-.env
-.env.*
-!.env.example
-
-# -----------------------------------------------------------------------------
-# SSL / CA bundles (machine-specific; see scripts/Configure-PythonSSL.ps1)
-# -----------------------------------------------------------------------------
-ssl/cacert-combined.pem
-ssl/*.pem
-!ssl/.gitkeep
-
-# -----------------------------------------------------------------------------
-# Datasets, weights, archives (large / reproducible or downloaded)
-# -----------------------------------------------------------------------------
-# Root-level data dirs only (avoid ignoring a Python package named `data` elsewhere)
-/data/
-/datasets/
-/raw/
-/downloads/
-
-# Caches created inside the repo (HF, pip, torch hubs, etc.)
-**/.cache/
-
-# Weight and export formats
-*.pt
-*.pth
-*.ckpt
-*.safetensors
-*.onnx
-*.engine
-*.plan
-*.trt
-*.mlmodel
-*.tflite
-*.h5
-*.pb
-
-# Archives (datasets, releases)
-*.zip
-*.tar
-*.tar.gz
-*.tgz
-*.rar
-*.7z
-
-# BoxMOT / TrackEval data trees populated after download
-boxmot/engine/trackeval/data/
-
-# -----------------------------------------------------------------------------
-# Experiments and run outputs
-# -----------------------------------------------------------------------------
-runs/
-**/runs/
-wandb/
-mlruns/
-lightning_logs/
-tensorboard/
-**/events.out.tfevents.*
-outputs/
-experiments/
-benchmark_results/
-
-# -----------------------------------------------------------------------------
-# Python
-# -----------------------------------------------------------------------------
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
+
+# C extensions
 *.so
+
+# Distribution / packaging
 .Python
 build/
 develop-eggs/
 dist/
+downloads/
 eggs/
 .eggs/
 lib/
@@ -95,152 +21,157 @@ sdist/
 var/
 wheels/
 share/python-wheels/
-pip-wheel-metadata/
 *.egg-info/
 .installed.cfg
 *.egg
 MANIFEST
-pip-log.txt
-pip-delete-this-directory.txt
+
+# PyInstaller
+#  Usually these files are written by a python script, before PyInstaller builds the exe, so may be non-existent
 *.manifest
 *.spec
 
-# Testing / typing / linters
-.pytest_cache/
-.mypy_cache/
-.dmypy.json
-dmypy.json
-.pyre/
-.pytype/
-cython_debug/
-.ruff_cache/
-.hypothesis/
-.coverage
-.coverage.*
-coverage.xml
-*.cover
-*.py,cover
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
 htmlcov/
 .tox/
 .nox/
+.coverage
+.coverage.*
+.cache
 nosetests.xml
-test-results/
-junit/
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
 
 # Translations
 *.mo
 *.pot
 
-# Sphinx / docs builds
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
 docs/_build/
-site/
 
 # PyBuilder
+.pybuilder/
 target/
 
-# Celery
-celerybeat-schedule
-celerybeat.pid
+# Jupyter Notebook
+.ipynb_checkpoints
 
-# SageMath
-*.sage.py
-
-# Spyder
-.spyderproject
-.spyproject
-
-# Rope
-.ropeproject
-
-# mkdocs
-/site
-
-# pyenv
-.python-version
-
-# pipenv (optional: remove Pipfile.lock from ignore if you pin deps for apps)
-# Pipfile.lock
-
-# PEP 582
-__pypackages__/
-
-# -----------------------------------------------------------------------------
-# Jupyter
-# -----------------------------------------------------------------------------
-.ipynb_checkpoints/
+# IPython
 profile_default/
 ipython_config.py
 
-# -----------------------------------------------------------------------------
-# PyCharm / IntelliJ
-# -----------------------------------------------------------------------------
+# pyenv
+#   For a library or binary, you wish to ignore any .python-version file.
+#   For a project, you usually wish to include it.
+# .python-version
+
+# pipenv
+#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
+#   However, in case of collaboration, if having platform-specific dependencies or dependencies
+#   having no cross-platform support, pipenv may install dependencies that don't work, or even
+#   fail to install them on other platforms. In this case, you should probably ignore Pipfile.lock.
+# Pipfile.lock
+
+# poetry
+#   Similar to Pipenv, see https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
+# poetry.lock
+
+# pdm
+#   Similar to Pipenv, see https://pdm.fming.dev/latest/usage/project/#commit-the-pdm-lock-file
+.pdm-python
+
+# PEP 582; used by e.g. github.com/pdm-project/pdm
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyderworkspace
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# PyCharm
 .idea/
-*.iml
-out/
 
-# -----------------------------------------------------------------------------
-# Visual Studio Code — ignore local overrides; commit shared JSON if present
-# -----------------------------------------------------------------------------
-.vscode/*
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json
-!.vscode/extensions.json
-!.vscode/*.code-snippets
+# VS Code
+.vscode/
 
-# -----------------------------------------------------------------------------
-# Cursor — local state; allow shared rules
-# -----------------------------------------------------------------------------
-.cursor/*
-!.cursor/rules/
-
-# -----------------------------------------------------------------------------
-# Other editors
-# -----------------------------------------------------------------------------
-*.swp
-*.swo
-*~
-.project
-.settings/
-*.sublime-project
-*.sublime-workspace
-
-# -----------------------------------------------------------------------------
-# OS
-# -----------------------------------------------------------------------------
-.DS_Store
-.AppleDouble
-.LSOverride
-._*
-.Spotlight-V100
-.Trashes
-Thumbs.db
-Thumbs.db:encryptable
-ehthumbs.db
-ehthumbs_vista.db
-Desktop.ini
-$RECYCLE.BIN/
-
-# Linux
-.fuse_hidden*
-.directory
-.Trash-*
-
-# -----------------------------------------------------------------------------
-# Logs and temp
-# -----------------------------------------------------------------------------
-*.log
-*.log.*
-logs/
-tmp/
-temp/
-.tmp/
-*.tmp
-*.temp
-*.bak
-
-# -----------------------------------------------------------------------------
-# Profiling
-# -----------------------------------------------------------------------------
-*.prof
-*.pstats
+# Project Specific
+pretrained/
+video-data-mot/
+*.mp4
+*.webm
+*.engine
+*.onnx
+*.zip
+*.pt
+*.pth
+outputs/
+archive.zip
+input_video.mp4
+mot17_test.mp4
+output.mp4
+output_hybrid.mp4
+output_mot17.mp4
+output_output.mp4
+output_samba.mp4
+output_yolox.mp4
+checkpoints/
+sambamotr/models/ops/build/
+sambamotr/models/ops/dist/
+sambamotr/models/ops/ms_deform_attn.egg-info/
+brain/

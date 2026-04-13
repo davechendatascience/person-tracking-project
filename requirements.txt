@@ -1,7 +1,9 @@
-# Python 3.10+ recommended (truststore needs 3.10+).
-boxmot>=17.0.0
-ultralytics>=8.0.0
-# BoxMOT's runtime installer calls `uv pip install` (see boxmot/utils/checks.py).
-uv>=0.4
-# Uses Windows certificate store (typical fix on managed networks with SSL inspection).
-truststore>=0.9
+rtmlib
+opencv-python
+onnxruntime
+yt-dlp
+cap_from_youtube
+cjm-byte-track
+torch
+torchvision
+ultralytics

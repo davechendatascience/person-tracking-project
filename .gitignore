@@ -175,3 +175,12 @@ sambamotr/models/ops/build/
 sambamotr/models/ops/dist/
 sambamotr/models/ops/ms_deform_attn.egg-info/
 brain/
+datasets/
+*/datasets/
+*/outputs/
+*/pretrained/
+*/saved_models/
+*/.ipynb_checkpoints/
+*/models/ops/build/
+*/models/ops/dist/
+*/models/ops/*.egg-info/

@@ -9,6 +9,8 @@ from ultralytics import YOLO
 import tempfile
 import shutil
 import yaml
+import os
+import torch
 
 from crowdbot.dataset import VideoSequence
 from follow_everything.perception.sam2_tracker import SAM2Tracker
@@ -105,6 +107,7 @@ def run_video_tracking():
     parser.add_argument("--target-color", type=str, default="red", choices=["red", "black", "any"])
     parser.add_argument("--no-reprompt", action="store_true", help="Disable re-propagation passes")
     parser.add_argument("--max-reprompts", type=int, default=2, help="Max number of re-propagation passes")
+    parser.add_argument("--show", action="store_true", help="Show real-time visualization window")
     args = parser.parse_args()
 
     output_dir = Path(args.output)
@@ -150,82 +153,120 @@ def run_video_tracking():
     
     print(f"[INFO] Found target at {target_box}. Starting tracking...")
 
-    # 4. Prepare sequence for SAM2
-    frames_to_track = list(range(args.start_frame, min(args.start_frame + args.num_frames, len(seq))))
-    image_seq = []
-    for i in tqdm(frames_to_track, desc="Loading Frames"):
-        img = seq[i].image
-        if img is not None:
-            image_seq.append(img)
+    # 4. Producer-Consumer Pipeline Setup
+    import threading
+    import time
+    from follow_everything.perception.sam2_tracker import StreamingFrameLoader
+
+    if os.path.exists("/dev/shm"):
+        base_temp_dir = Path("/dev/shm")
+    else:
+        base_temp_dir = Path(tempfile.gettempdir())
     
-    # 5. Run SAM2 Tracking
-    # SAM2 init_state expects a directory of JPGs
-    temp_frames_dir = Path(tempfile.mkdtemp())
+    temp_frames_dir = base_temp_dir / f"sam2_{os.getpid()}_{int(time.time())}"
+    temp_frames_dir.mkdir(parents=True, exist_ok=True)
+    
+    frames_to_track = list(range(args.start_frame, min(args.start_frame + args.num_frames, len(seq))))
+    total_expected = len(frames_to_track)
+    img_paths = [temp_frames_dir / f"{i:06d}.jpg" for i in range(total_expected)]
+
+    extraction_done = threading.Event()
+    stop_extraction = threading.Event()
+    
+    def extraction_worker():
+        print(f"[INFO] Extraction thread started.")
+        for i, frame_idx in enumerate(frames_to_track):
+            if stop_extraction.is_set(): break
+            fd = seq[frame_idx]
+            if fd.image is not None:
+                # Optimized write: write to tmp then rename for atomicity
+                tmp_path = temp_frames_dir / f"{i:06d}_tmp.jpg"
+                cv2.imwrite(str(tmp_path), cv2.cvtColor(fd.image, cv2.COLOR_RGB2BGR))
+                tmp_path.replace(temp_frames_dir / f"{i:06d}.jpg")
+        extraction_done.set()
+        print("[INFO] Extraction thread finished.")
+
+    extractor_thread = threading.Thread(target=extraction_worker, daemon=True)
+    extractor_thread.start()
+
+    # 5. Run & Pipeline Tracking + Visualization + Video Export
     try:
-        print(f"[INFO] Preparing temporary frames in {temp_frames_dir}...")
-        for i, img in enumerate(image_seq):
-            # SAM2 expects frames to be named in a way it can sort
-            cv2.imwrite(str(temp_frames_dir / f"{i:06d}.jpg"), cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        video_out_path = output_dir / "tracking_result.mp4"
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        video_writer = None
         
-        prompts = {0: [target_box]} 
-        results = tracker.track_sequence(
-            temp_frames_dir, 
+        # Initialize the Streaming Loader (will block on index access if file not ready)
+        loader = StreamingFrameLoader(
+            img_paths=img_paths,
+            image_size=tracker._scfg.get("image_size", 1024),
+            device=tracker._scfg["device"]
+        )
+
+        print("[INFO] Starting synchronized tracking & visualization...")
+        tracker_gen = tracker.track_sequence(
+            loader, 
             np.array(target_box), 
             allow_reprompt=not args.no_reprompt,
             max_reprompts=args.max_reprompts
         )
-    finally:
-        # We'll keep it for now for debugging if needed, but shutil.rmtree(temp_frames_dir) is better
-        pass
-    
-    # 6. Visualization (Faster with CV2)
-    print("[INFO] Saving visualization frames...")
-    for i, res in enumerate(tqdm(results.values() if isinstance(results, dict) else results, desc="Visualizing")):
-        frame_idx = frames_to_track[i]
-        img_rgb = image_seq[i]
         
-        # Convert RGB to BGR for CV2
-        viz_img = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-        
-        if res.is_visible and res.mask is not None:
-            mask = res.mask
-            # Draw red mask overlay efficiently
-            colored_mask = np.zeros_like(viz_img)
-            colored_mask[mask] = [0, 0, 255] # Red in BGR
-            cv2.addWeighted(viz_img, 1.0, colored_mask, 0.4, 0, viz_img)
+        for i, (f_idx, res) in enumerate(tqdm(tracker_gen, total=total_expected, desc="Pipelined Tracking")):
+            if f_idx >= len(img_paths): continue
+            # Load frame for visualization
+            frame_path = img_paths[f_idx]
+            viz_img = cv2.imread(str(frame_path))
+            if viz_img is None: continue
             
-            if res.centroid_uv:
-                cx, cy = map(int, res.centroid_uv)
-                cv2.drawMarker(viz_img, (cx, cy), (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
-        
-        # Draw initial target box on first frame
-        if i == 0:
-            x1, y1, x2, y2 = map(int, target_box)
-            cv2.rectangle(viz_img, (x1, y1), (x2, y2), (255, 0, 0), 2)
-            cv2.putText(viz_img, "Target Identified", (x1, y1-10), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
+            # Apply Visualization
+            if res.is_visible and res.mask is not None:
+                mask = res.mask
+                colored_mask = np.zeros_like(viz_img)
+                colored_mask[mask] = [0, 0, 255] # Red in BGR
+                cv2.addWeighted(viz_img, 1.0, colored_mask, 0.4, 0, viz_img)
+                if res.centroid_uv:
+                    cx, cy = map(int, res.centroid_uv)
+                    cv2.drawMarker(viz_img, (cx, cy), (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
+            
+            if i == 0:
+                x1, y1, x2, y2 = map(int, target_box)
+                cv2.rectangle(viz_img, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                cv2.putText(viz_img, "Target Identified", (x1, y1-10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
 
-        cv2.putText(viz_img, f"Frame {frame_idx}", (20, 40), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+            cv2.putText(viz_img, f"Frame {frames_to_track[f_idx]}", (20, 40), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
         
-        cv2.imwrite(str(viz_dir / f"{frame_idx:06d}.jpg"), viz_img)
+            # Show Window (Optional)
+            if getattr(args, 'show', False):
+                cv2.imshow("Follow Everything Real-Time", viz_img)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    args.show = False
+                    stop_extraction.set()
+            
+            # Save visualization frame
+            cv2.imwrite(str(viz_dir / f"{frames_to_track[f_idx]:06d}.jpg"), viz_img)
+            
+            # Write to Video
+            if video_writer is None:
+                h, w = viz_img.shape[:2]
+                video_writer = cv2.VideoWriter(str(video_out_path), fourcc, 30.0, (w, h))
+            video_writer.write(viz_img)
 
-    # 7. Compile to Video
-    video_out_path = output_dir / "tracking_result.mp4"
-    if len(image_seq) > 0:
-        h, w = image_seq[0].shape[:2]
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        video_writer = cv2.VideoWriter(str(video_out_path), fourcc, 30.0, (w, h))
+    finally:
+        stop_extraction.set()
+        if 'extractor_thread' in locals():
+            print("[INFO] Waiting for extraction thread to finish...")
+            extractor_thread.join(timeout=5.0)
         
-        print(f"[INFO] Compiling frames into video: {video_out_path}")
-        for i in range(len(image_seq)):
-            frame_path = viz_dir / f"{frames_to_track[i]:06d}.jpg"
-            if frame_path.exists():
-                frame = cv2.imread(str(frame_path))
-                video_writer.write(frame)
-        video_writer.release()
+        if video_writer:
+            video_writer.release()
+        cv2.destroyAllWindows()
 
-    print(f"[INFO] Finished. Results saved to {output_dir}")
+        # Clean up temp frames
+        if 'temp_frames_dir' in locals() and temp_frames_dir.exists():
+            shutil.rmtree(temp_frames_dir)
+
+    print(f"[INFO] Processing finished. Results saved to {output_dir}")
 
 if __name__ == "__main__":
     run_video_tracking()

@@ -16,11 +16,60 @@ from __future__ import annotations
 import os
 import tempfile
 from dataclasses import dataclass, field
+from collections import OrderedDict
+from typing import Dict, List, Optional, Tuple, Iterator, Union
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
 import cv2
 import numpy as np
+import time
+
+class StreamingFrameLoader:
+    """A lazy-loading frame source for SAM2 that blocks until frames appear."""
+    def __init__(self, img_paths, image_size, device, offload=False):
+        import torch
+        from PIL import Image
+        self.img_paths = [Path(p) for p in img_paths]
+        self.image_size = image_size
+        self.device = device
+        self.offload = offload
+        self.images = [None] * len(img_paths)
+        self.img_mean = torch.tensor((0.485, 0.456, 0.406), device=device)[:, None, None]
+        self.img_std = torch.tensor((0.229, 0.224, 0.225), device=device)[:, None, None]
+        self.video_height = None
+        self.video_width = None
+
+    def __len__(self):
+        return len(self.img_paths)
+
+    def __getitem__(self, index):
+        import time
+        import torch
+        from PIL import Image
+        import numpy as np
+        
+        if self.images[index] is not None:
+            return self.images[index]
+
+        path = self.img_paths[index]
+        wait_start = time.time()
+        while not path.exists():
+            if time.time() - wait_start > 60.0:
+                raise TimeoutError(f"Missing frame at {path} after 60s")
+            time.sleep(0.01)
+
+        img_pil = Image.open(path)
+        if self.video_height is None:
+            self.video_width, self.video_height = img_pil.size
+            
+        img_np = np.array(img_pil.convert("RGB").resize((self.image_size, self.image_size)))
+        img = torch.from_numpy(img_np / 255.0).permute(2, 0, 1).float()
+        img = (img.to(self.device) - self.img_mean) / self.img_std
+        
+        if self.offload:
+            img = img.cpu()
+        
+        self.images[index] = img
+        return img
 
 
 @dataclass
@@ -67,26 +116,20 @@ class SAM2Tracker:
     # ------------------------------------------------------------------
     def track_sequence(
         self,
-        frames_dir:   str | Path,
+        frames_dir:   Union[str, Path, StreamingFrameLoader],
         initial_bbox: np.ndarray,
         depth_seq:    Optional[List[Optional[np.ndarray]]] = None,
         allow_reprompt: bool = True,
         max_reprompts:  int = 2,
-    ) -> Dict[int, TrackResult]:
-        """Process an entire frame sequence with distance-buffer re-prompting.
+    ) -> Iterator[Tuple[int, TrackResult]]:
+        """Process an entire frame sequence with synchronous streaming.
 
-        Args:
-            frames_dir:   Directory of zero-padded JPEG/PNG frames (SAM2 format).
-            initial_bbox: [x1, y1, x2, y2] for the leader in frame 0.
-            depth_seq:    Optional list of (H, W) depth arrays (metres) per frame.
-
-        Returns:
-            Dict mapping frame_idx → TrackResult.
+        Yields:
+            Tuple of (frame_idx, TrackResult).
         """
         import torch
         from sam2.build_sam import build_sam2_video_predictor
 
-        frames_dir = Path(frames_dir)
         if self._predictor is None:
             device = self._scfg["device"] if torch.cuda.is_available() else "cpu"
             self._predictor = build_sam2_video_predictor(
@@ -95,39 +138,66 @@ class SAM2Tracker:
                 device=device,
             )
 
-        results: Dict[int, TrackResult] = {}
         self._dist_buf.clear()
         self._temp_buf.clear()
 
+        # Build inference state
         with torch.inference_mode(), \
              torch.autocast(self._scfg["device"], dtype=torch.bfloat16):
 
-            state = self._predictor.init_state(video_path=str(frames_dir))
+            # Case 1: Standard directory (Offline)
+            if not isinstance(frames_dir, StreamingFrameLoader):
+                state = self._predictor.init_state(video_path=str(frames_dir))
+            else:
+                # Case 2: StreamingFrameLoader (Online)
+                state = {}
+                state["images"] = frames_dir
+                state["num_frames"] = len(frames_dir)
+                state["offload_video_to_cpu"] = frames_dir.offload
+                state["offload_state_to_cpu"] = False
+                state["video_height"] = frames_dir.video_height or 0
+                state["video_width"] = frames_dir.video_width or 0
+                state["device"] = self._predictor.device
+                state["storage_device"] = self._predictor.device
+                state["point_inputs_per_obj"] = {}
+                state["mask_inputs_per_obj"] = {}
+                state["cached_features"] = {}
+                state["constants"] = {}
+                state["obj_id_to_idx"] = OrderedDict()
+                state["obj_idx_to_id"] = OrderedDict()
+                state["obj_ids"] = []
+                state["output_dict_per_obj"] = {}
+                state["temp_output_dict_per_obj"] = {}
+                state["frames_tracked_per_obj"] = {}
+                
+                # Warm up visual backbone
+                self._predictor._get_image_feature(state, frame_idx=0, batch_size=1)
+                
+                # Sync height/width from loader after it loaded frame 0
+                state["video_height"] = frames_dir.video_height
+                state["video_width"] = frames_dir.video_width
+
             self._predictor.add_new_points_or_box(
                 state, frame_idx=0, obj_id=1,
                 box=initial_bbox.astype(np.float32),
             )
 
-            # Initial distance estimate for buffer seeding
-            init_dist = 2.0
-            if depth_seq and depth_seq[0] is not None:
-                init_dist = self._depth_at_bbox(initial_bbox, depth_seq[0])
-            self._update_buffer(0, initial_bbox, init_dist, 1.0)
-
             # Tracking passes
             reprompt_from = 0
             reprompt_count = 0
-             
-            # Generator for propagation
-            track_gen = self._predictor.propagate_in_video(state, start_frame_idx=reprompt_from)
             
             while True:
                 lost_at = None
+                # Generator for propagation
+                track_gen = self._predictor.propagate_in_video(state, start_frame_idx=reprompt_from)
+                
                 try:
                     for frame_idx, obj_ids, masks in track_gen:
                         mask_np = (masks[0, 0] > 0.0).cpu().numpy()
                         conf = self._compute_confidence(mask_np)
-                        results[frame_idx] = self._make_result(mask_np, conf)
+                        res = self._make_result(mask_np, conf)
+                        
+                        yield frame_idx, res
 
                         # Update buffers while tracking confidently
                         if conf >= self._pcfg["min_mask_confidence"]:
@@ -138,29 +208,25 @@ class SAM2Tracker:
                             bbox = self._mask_to_bbox(mask_np)
                             if bbox is not None:
                                 self._update_buffer(frame_idx, bbox, dist, conf)
-
-                        # Detect leader loss
+                        
+                        # Detect loss
+                        if conf < self._pcfg["min_mask_confidence"] and frame_idx > 0:
+                            if lost_at is None:
+                                lost_at = frame_idx
+                                if not allow_reprompt: break
                         elif lost_at is None and frame_idx > reprompt_from:
                             lost_at = frame_idx
-                            if not allow_reprompt:
-                                # In online mode, we don't rewind. We just continue or wait.
-                                # For now, we'll just continue tracking (SAM2 might recover itself)
-                                pass
+                            if not allow_reprompt: pass
 
                 except StopIteration:
                     pass
 
-                # Try one re-prompt cycle if we detected loss and it's enabled (Offline mode only)
+                # Try one re-prompt cycle if we detected loss and it's enabled
                 if lost_at is not None and allow_reprompt and reprompt_count < max_reprompts:
-                    print(f"[DEBUG] Leader lost at {lost_at}. Attempting re-prompt recovery {reprompt_count+1}/{max_reprompts}...")
                     entry = self._best_reprompt_entry(
                         expected_dist=self._predict_reprompt_distance()
                     )
                     if entry is not None and entry.frame_idx < lost_at:
-                        self._predictor.add_new_points_or_box(
-                            state, frame_idx=entry.frame_idx, obj_id=1,
-                            box=entry.bbox,
-                        )
                         reprompt_from = entry.frame_idx
                         reprompt_count += 1
                         # Restart generator from the re-prompt point

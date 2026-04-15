@@ -1,9 +1,52 @@
-rtmlib
-opencv-python
-onnxruntime
-yt-dlp
-cap_from_youtube
-cjm-byte-track
-torch
-torchvision
-ultralytics
+# -----------------------------------------------------------------------
+# person-tracking-project — Follow Everything on JRDB
+# -----------------------------------------------------------------------
+# NOTE: PyTorch must be installed FIRST with the correct CUDA wheel.
+#       This project was developed with CUDA 13.0 (cu130 nightly).
+#       Install before running `pip install -r requirements.txt`:
+#
+#   pip install --pre torch torchvision torchaudio \
+#       --index-url https://download.pytorch.org/whl/nightly/cu130
+# -----------------------------------------------------------------------
+
+# SAM2 — leader segmentation & tracking (weights: sam2.1_hiera_base_plus.pt)
+# Requires torch to already be installed
+git+https://github.com/facebookresearch/sam2.git
+
+# Detection (weights: yolo11m.pt)
+ultralytics>=8.3.0
+
+# Vision / image I/O
+opencv-python>=4.9.0
+Pillow>=10.0.0
+
+# Numerical & scientific
+numpy>=1.26.0
+scipy>=1.13.0
+einops>=0.8.0
+
+# State estimation — EKF for leader pose tracking
+filterpy>=1.4.5
+
+# Geometry & planning
+shapely>=2.0.0          # obstacle boundary operations, polygon intersection
+networkx>=3.3           # topological graph construction & traversal
+scikit-image>=0.24.0    # connected-component labelling for obstacle clustering
+
+# Point cloud / LiDAR
+# open3d has no aarch64/Python 3.12 wheels — using lightweight alternatives instead
+pypcd4>=1.1.0           # pure-Python .pcd file reader (JRDB LiDAR format)
+plyfile>=1.0.3          # read .ply point cloud files
+
+# ROS bag reading (pure Python, no ROS installation required)
+rosbags>=0.10.0         # read ROS1 bag files from CrowdBot_v2
+
+# Data handling
+pandas>=2.2.0           # annotation tables
+pyyaml>=6.0.1           # config files
+omegaconf>=2.3.0        # structured config (used by SAM2 / Hydra)
+hydra-core>=1.3.2       # SAM2 model config loading
+
+# Visualisation & progress
+matplotlib>=3.9.0
+tqdm>=4.66.0

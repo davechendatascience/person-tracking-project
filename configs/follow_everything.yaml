@@ -1,0 +1,72 @@
+sam2:
+  # relative to project root
+  checkpoint: "sam2.1_hiera_base_plus.pt"
+  # config key inside the SAM2 package (used by build_sam2_video_predictor)
+  model_cfg: "configs/sam2.1/sam2.1_hiera_b+.yaml"
+  device: "cuda"
+
+crowdbot:
+  processed_dir: "data/crowdbot"        # root of extracted CrowdBot_v2 zip
+  # ROS1 bag topics (standard RealSense D435 + Velodyne namespaces)
+  topic_rgb:   "/camera/color/image_raw"
+  topic_depth: "/camera/depth/image_rect_raw"
+  topic_caminfo: "/camera/color/camera_info"
+  topic_lidar_front: "/front_lidar/velodyne_points"
+  topic_lidar_rear:  "/rear_lidar/velodyne_points"
+  # Approximate LiDAR→camera translation in metres (x-fwd, y-left, z-up)
+  lidar_to_cam_t: [0.0, 0.0, 0.05]
+  # RealSense D435 default intrinsics at 640×480 (overridden from bag if available)
+  default_fx: 612.0
+  default_fy: 612.0
+  default_cx: 320.0
+  default_cy: 240.0
+
+perception:
+  temporal_buffer_size: 10             # top-N high-confidence temporal embeddings
+  num_distance_bins: 5                 # distance frame buffer buckets
+  distance_bin_width: 1.0              # metres per bin (bins: 0-1, 1-2, ..., 4-5+)
+  min_mask_confidence: 0.40            # below this → leader considered lost
+  min_mask_area_ratio: 0.0005          # mask / image area — reject tiny false positives
+  fov_half_angle_deg: 90.0            # half-FOV; outside = leader left FOV
+
+ekf:
+  dt: 0.067                            # ~15 fps (JRDB capture rate)
+  process_noise_std: 0.3               # acceleration uncertainty (m/s²)
+  measurement_noise_std: 0.4           # depth projection noise (m)
+  initial_uncertainty: 5.0
+
+occupancy_grid:
+  resolution: 0.1                      # metres per cell
+  map_size: 12.0                       # metres, square map centred on robot
+  inflation_radius: 0.45               # robot radius + clearance margin
+  min_lidar_height: 0.05               # filter floor returns (m)
+  max_lidar_height: 2.0                # filter above-head returns (m)
+
+planning:
+  robot_radius: 0.3                    # used for collision checks
+  goal_tolerance: 0.25                 # metres
+  max_candidates: 8                    # homotopy path candidates
+  min_boundary_spacing: 0.5           # metres between boundary sample points
+  los_check_resolution: 0.05          # line-of-sight step size (m)
+
+control:
+  # Safe-distance circle (Following state)
+  d_min: 0.8                           # minimum following distance (m)
+  d_max: 3.0                           # max following distance before CHASING
+  nis_alpha: 0.4                       # NIS → safe-distance scale factor
+  # Chasing speed adaptation
+  v_alpha1: 0.6                        # leader velocity weight
+  v_alpha2: 0.4                        # leader distance weight
+  # Velocity limits
+  max_linear_vel: 1.5                  # m/s
+  max_angular_vel: 1.2                 # rad/s
+  # Controller gains
+  k_angular: 2.0                       # proportional heading gain
+  lookahead: 0.8                       # pure-pursuit lookahead (m)
+  # State timeouts
+  search_timeout_s: 5.0                # seconds without leader before STOPPED
+
+robot:
+  dt: 0.067
+  max_linear_vel: 1.5
+  max_angular_vel: 1.2

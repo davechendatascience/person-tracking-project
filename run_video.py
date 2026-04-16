@@ -109,6 +109,8 @@ def run_video_tracking():
     parser.add_argument("--max-reprompts", type=int, default=2, help="Max number of re-propagation passes")
     parser.add_argument("--show", action="store_true", help="Show real-time visualization window")
     parser.add_argument("--out-video", type=str, default=None, help="Designated output video file path")
+    parser.add_argument("--frame-stride", type=int, default=1,
+                        help="Process every Nth frame (e.g. --frame-stride 2 halves frames and ~doubles throughput)")
     args = parser.parse_args()
 
     output_dir = Path(args.output)
@@ -167,7 +169,8 @@ def run_video_tracking():
     temp_frames_dir = base_temp_dir / f"sam2_{os.getpid()}_{int(time.time())}"
     temp_frames_dir.mkdir(parents=True, exist_ok=True)
     
-    frames_to_track = list(range(args.start_frame, min(args.start_frame + args.num_frames, len(seq))))
+    _all_frames = list(range(args.start_frame, min(args.start_frame + args.num_frames, len(seq))))
+    frames_to_track = _all_frames[::args.frame_stride]
     total_expected = len(frames_to_track)
     img_paths = [temp_frames_dir / f"{i:06d}.jpg" for i in range(total_expected)]
 
@@ -191,16 +194,39 @@ def run_video_tracking():
     extractor_thread.start()
 
     # 5. Run & Pipeline Tracking + Visualization + Video Export
+    import queue as _queue
+
+    if args.out_video:
+        video_out_path = Path(args.out_video)
+        video_out_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        video_out_path = output_dir / "tracking_result.mp4"
+
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+
+    # Async write thread: offloads cv2.imwrite + H.264 encoding off SAM2's critical path
+    _write_q = _queue.Queue(maxsize=16)
+
+    def _write_worker():
+        _vw = None
+        while True:
+            item = _write_q.get()
+            if item is None:
+                break
+            frame_img, orig_frame_num = item
+            cv2.imwrite(str(viz_dir / f"{orig_frame_num:06d}.jpg"), frame_img)
+            if _vw is None:
+                h, w = frame_img.shape[:2]
+                _vw = cv2.VideoWriter(str(video_out_path), fourcc, 30.0, (w, h))
+            _vw.write(frame_img)
+            _write_q.task_done()
+        if _vw:
+            _vw.release()
+
+    _write_thread = threading.Thread(target=_write_worker, daemon=False)
+    _write_thread.start()
+
     try:
-        if args.out_video:
-            video_out_path = Path(args.out_video)
-            video_out_path.parent.mkdir(parents=True, exist_ok=True)
-        else:
-            video_out_path = output_dir / "tracking_result.mp4"
-            
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        video_writer = None
-        
         # Initialize the Streaming Loader (will block on index access if file not ready)
         loader = StreamingFrameLoader(
             img_paths=img_paths,
@@ -210,19 +236,19 @@ def run_video_tracking():
 
         print("[INFO] Starting synchronized tracking & visualization...")
         tracker_gen = tracker.track_sequence(
-            loader, 
-            np.array(target_box), 
+            loader,
+            np.array(target_box),
             allow_reprompt=not args.no_reprompt,
             max_reprompts=args.max_reprompts
         )
-        
+
         for i, (f_idx, res) in enumerate(tqdm(tracker_gen, total=total_expected, desc="Pipelined Tracking")):
             if f_idx >= len(img_paths): continue
             # Load frame for visualization
             frame_path = img_paths[f_idx]
             viz_img = cv2.imread(str(frame_path))
             if viz_img is None: continue
-            
+
             # Apply Visualization
             if res.is_visible and res.mask is not None:
                 mask = res.mask
@@ -232,40 +258,33 @@ def run_video_tracking():
                 if res.centroid_uv:
                     cx, cy = map(int, res.centroid_uv)
                     cv2.drawMarker(viz_img, (cx, cy), (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
-            
+
             if i == 0:
                 x1, y1, x2, y2 = map(int, target_box)
                 cv2.rectangle(viz_img, (x1, y1), (x2, y2), (255, 0, 0), 2)
-                cv2.putText(viz_img, "Target Identified", (x1, y1-10), 
+                cv2.putText(viz_img, "Target Identified", (x1, y1-10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
 
-            cv2.putText(viz_img, f"Frame {frames_to_track[f_idx]}", (20, 40), 
+            cv2.putText(viz_img, f"Frame {frames_to_track[f_idx]}", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-        
-            # Show Window (Optional)
+
+            # Show Window (Optional — must stay on main thread)
             if getattr(args, 'show', False):
                 cv2.imshow("Follow Everything Real-Time", viz_img)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     args.show = False
                     stop_extraction.set()
-            
-            # Save visualization frame
-            cv2.imwrite(str(viz_dir / f"{frames_to_track[f_idx]:06d}.jpg"), viz_img)
-            
-            # Write to Video
-            if video_writer is None:
-                h, w = viz_img.shape[:2]
-                video_writer = cv2.VideoWriter(str(video_out_path), fourcc, 30.0, (w, h))
-            video_writer.write(viz_img)
+
+            # Hand off disk writes to background thread
+            _write_q.put((viz_img, frames_to_track[f_idx]))
 
     finally:
+        _write_q.put(None)  # signal writer to flush and exit
+        _write_thread.join()
         stop_extraction.set()
         if 'extractor_thread' in locals():
             print("[INFO] Waiting for extraction thread to finish...")
             extractor_thread.join(timeout=5.0)
-        
-        if video_writer:
-            video_writer.release()
         cv2.destroyAllWindows()
 
         # Clean up temp frames

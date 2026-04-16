@@ -58,6 +58,9 @@ python run_video.py --video data/test.mp4 --max-reprompts 1
 
 # 指定輸出影片路徑並開啟即時視覺化視窗
 python run_video.py --video data/test.mp4 --out-video results/my_result.mp4 --show
+
+# 提升處理速度：每隔一幀取樣（約 2× 吞吐量）
+python run_video.py --video data/test.mp4 --frame-stride 2
 ```
 
 ### 3. 可用參數
@@ -71,6 +74,24 @@ python run_video.py --video data/test.mp4 --out-video results/my_result.mp4 --sh
 *   `--max-reprompts`: 設定最大回溯次數（預設：`2`）。
 *   `--show`: 開啟即時視覺化視窗（按 `q` 退出）。
 *   `--out-video`: 指定輸出影片檔案路徑（預設儲存至 `<output>/tracking_result.mp4`）。
+*   `--frame-stride`: 每隔 N 幀處理一幀（預設：`1`）。`--frame-stride 2` 約可使吞吐量翻倍，適合對延遲容忍度較高的場景。
+
+### 4. 效能調校
+
+#### 方法一：Frame Stride（最直接）
+```bash
+python run_video.py --video data/test.mp4 --frame-stride 2   # ~2× 速度
+python run_video.py --video data/test.mp4 --frame-stride 3   # ~3× 速度
+```
+跳幀追蹤，適合低速移動或離線批次處理場景。
+
+#### 方法二：VOS 優化編譯（初次需 1-3 分鐘預熱）
+在 `configs/follow_everything.yaml` 中啟用：
+```yaml
+sam2:
+  vos_optimized: true
+```
+啟用後，SAM2 的 memory attention、mask decoder 等組件會以 `torch.compile(mode="max-autotune")` 編譯，**第一次執行會觸發長達 1-3 分鐘的編譯**，之後快取於 `~/.cache/torch_extensions`，後續執行速度顯著提升。
 
 ## 專案結構說明
 

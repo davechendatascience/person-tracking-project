@@ -132,10 +132,14 @@ class SAM2Tracker:
 
         if self._predictor is None:
             device = self._scfg["device"] if torch.cuda.is_available() else "cpu"
+            vos_optimized = self._scfg.get("vos_optimized", False)
+            if vos_optimized:
+                print("[INFO] Building VOS-optimized predictor (torch.compile warm-up on first run ~1-3 min)...")
             self._predictor = build_sam2_video_predictor(
                 config_file=self._scfg["model_cfg"],
                 ckpt_path=self._scfg["checkpoint"],
                 device=device,
+                vos_optimized=vos_optimized,
             )
 
         self._dist_buf.clear()

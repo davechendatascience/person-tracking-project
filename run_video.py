@@ -269,9 +269,7 @@ def run_video_tracking():
             tracker_gen = tracker.track_sequence_multi(
                 loader,
                 yolo_model_path=args.yolo_model,
-                disappearance_timeout_frames=args.disappearance_frames,
                 yolo_conf_threshold=args.yolo_conf,
-                confirm_frames=args.confirm_frames,
             )
 
         for i, frame_output in enumerate(tqdm(tracker_gen, total=total_expected, desc="Tracking")):

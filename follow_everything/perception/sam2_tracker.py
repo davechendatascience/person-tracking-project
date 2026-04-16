@@ -252,29 +252,17 @@ class SAM2Tracker:
     # ------------------------------------------------------------------
     def track_sequence_multi(
         self,
-        frames_dir:   Union[str, Path, "StreamingFrameLoader"],
-        yolo_model_path: str = "yolo11m.pt",
-        disappearance_timeout_frames: int = 300,
+        frames_dir: Union[str, Path, "StreamingFrameLoader"],
+        yolo_model_path: str = "yolo11m-seg.pt",
         yolo_conf_threshold: float = 0.45,
-        confirm_frames: int = 2,
+        **_kwargs,  # absorb legacy args (disappearance_timeout_frames, etc.)
     ) -> Iterator[Tuple[int, Dict[int, "TrackResult"]]]:
-        """Multi-person tracking, matching the single-person memory-bank pattern.
+        """Multi-person tracking: detect all persons in frame 0, track with SAM2.
 
-        Architecture:
-          - One persistent SAM2 propagation generator advances through the
-            sequence one frame at a time (identical to single-person mode).
-            SAM2's memory bank is the sole tracking engine for known persons.
-          - YOLO runs every frame but ONLY to detect new persons. It is never
-            used to re-prompt SAM2 for already-tracked persons.
-          - New-person candidates are gated by cosine similarity on SAM2's
-            cached backbone FPN features, so the check is robust even when
-            SAM2 masks collapse during occlusion.
-          - A ``confirm_frames``-sighting window suppresses YOLO false positives.
-          - When a new person is confirmed, ``add_new_points_or_box`` registers
-            them (SAM2 internally runs its decoder on that frame to generate the
-            initial conditioning mask). The propagation generator is then
-            restarted from the *next* frame so SAM2 picks up the new person
-            seamlessly via its memory bank.
+        All persons visible in the first frame are detected by YOLO and
+        registered with SAM2 (using segmentation masks when available, bbox
+        prompts otherwise).  SAM2's memory bank then handles the rest of the
+        sequence — no YOLO runs after initialisation.
 
         Yields:
             Tuple of (frame_idx, {obj_id: TrackResult}).
@@ -292,288 +280,89 @@ class SAM2Tracker:
             state = self._build_inference_state(frames_dir)
             num_frames = state["num_frames"]
 
-            next_obj_id  = 1
-            next_pend_id = 0
-            # active_objs: obj_id → {last_seen, last_bbox, appearance_vec (optional)}
-            active_objs: Dict[int, dict] = {}
-            # pending: cand_id → {bbox, first_frame}  — awaiting confirmation
-            pending: Dict[int, dict] = {}
+            # ----------------------------------------------------------
+            # 1. Read frame 0 and detect all persons with YOLO.
+            # ----------------------------------------------------------
+            if isinstance(frames_dir, StreamingFrameLoader):
+                frame0_bgr = self._wait_and_read_bgr(frames_dir.img_paths[0])
+            else:
+                frame0_bgr = cv2.imread(str(Path(frames_dir) / "000000.jpg"))
 
-            # SAM2 propagation generator — started (or restarted) whenever
-            # active_objs changes. None until the first person is confirmed.
-            _prop_gen = None
-            _prop_next = 0  # frame index _prop_gen will yield next
-
-            for frame_idx in range(num_frames):
-                # ----------------------------------------------------------
-                # 1. BGR frame for YOLO.
-                # ----------------------------------------------------------
-                if isinstance(frames_dir, StreamingFrameLoader):
-                    frame_bgr = self._wait_and_read_bgr(frames_dir.img_paths[frame_idx])
-                else:
-                    frame_bgr = cv2.imread(
-                        str(Path(frames_dir) / f"{frame_idx:06d}.jpg")
-                    )
-
-                if frame_bgr is None:
+            if frame0_bgr is None:
+                for frame_idx in range(num_frames):
                     yield frame_idx, {}
-                    continue
+                return
 
-                vid_h = state["video_height"] or frame_bgr.shape[0]
-                vid_w = state["video_width"]  or frame_bgr.shape[1]
-
-                # ----------------------------------------------------------
-                # 2. SAM2 memory-bank tracking step.
-                #    Consume exactly one frame from the persistent generator —
-                #    same pattern as single-person mode.  SAM2 uses its
-                #    accumulated memory from all prior frames automatically.
-                # ----------------------------------------------------------
-                results: Dict[int, TrackResult] = {}
-                if active_objs and _prop_gen is not None and _prop_next == frame_idx:
-                    out_frame, obj_ids_out, masks_out = next(_prop_gen)
-                    _prop_next = out_frame + 1
-                    for i, oid in enumerate(obj_ids_out):
-                        if oid not in active_objs:
-                            continue
-                        mask_np = (masks_out[i, 0] > 0.0).cpu().numpy()
-                        conf    = self._compute_confidence(mask_np)
-                        res     = self._make_result(mask_np, conf)
-                        results[oid] = res
-                        if res.is_visible:
-                            active_objs[oid]["last_seen"] = frame_idx
-                            bbox = self._mask_to_bbox(mask_np)
-                            if bbox is not None:
-                                active_objs[oid]["last_bbox"] = bbox
-                            # Track peak mask area so deduplication can
-                            # distinguish healthy masks from collapsed ones.
-                            mask_area = int(mask_np.sum())
-                            active_objs[oid]["max_area"] = max(
-                                active_objs[oid].get("max_area", 0), mask_area
-                            )
-
-                # ----------------------------------------------------------
-                # 2b. Mask-overlap deduplication.
-                #     If two tracked objects have highly similar segmentation
-                #     masks (IoU >= 0.8), discard the newer identity (higher
-                #     obj_id). This handles the re-registration ghost: when a
-                #     person's SAM2 mask temporarily collapses and they get
-                #     re-registered with a new ID, both IDs lock onto the same
-                #     body pixels → IoU ≈ 1.0. Two genuinely different people
-                #     have non-overlapping body pixels regardless of proximity,
-                #     so IoU stays low and they are never incorrectly merged.
-                #
-                #     Safety gate: only deduplicate when BOTH masks are >= 50%
-                #     of their historical peak area. Collapsed/drifted masks
-                #     (e.g. two people simultaneously occluded behind a third)
-                #     shrink well below this threshold, so their incidental
-                #     overlap never triggers a false removal.
-                # ----------------------------------------------------------
-                visible_oids = sorted(
-                    [oid for oid, res in results.items()
-                     if res.is_visible and res.mask is not None],
-                )  # ascending order → older IDs come first
-                to_remove: set = set()
-                for a_idx, oid_a in enumerate(visible_oids):
-                    if oid_a in to_remove:
-                        continue
-                    mask_a = results[oid_a].mask
-                    area_a = int(mask_a.sum())
-                    if area_a == 0:
-                        continue
-                    max_area_a = active_objs.get(oid_a, {}).get("max_area", area_a) or area_a
-                    for oid_b in visible_oids[a_idx + 1:]:
-                        if oid_b in to_remove:
-                            continue
-                        mask_b = results[oid_b].mask
-                        area_b = int(mask_b.sum())
-                        if area_b == 0:
-                            continue
-                        # Skip if either mask has collapsed below 50% of its
-                        # historical peak — it's an occlusion artefact, not a ghost.
-                        max_area_b = active_objs.get(oid_b, {}).get("max_area", area_b) or area_b
-                        if area_a < 0.5 * max_area_a or area_b < 0.5 * max_area_b:
-                            continue
-                        intersection = int((mask_a & mask_b).sum())
-                        union = area_a + area_b - intersection
-                        mask_iou = intersection / union if union > 0 else 0.0
-                        if mask_iou >= 0.8:
-                            to_remove.add(oid_b)  # discard newer (higher) ID
-                if to_remove:
-                    for oid in to_remove:
-                        results.pop(oid, None)
-                        active_objs.pop(oid, None)
-
-                # ----------------------------------------------------------
-                # 3. YOLO detection (new-person scouting only).
-                #    If the model outputs pose keypoints (e.g. yolo11m-pose.pt)
-                #    we store per-detection keypoint counts for shadow rejection.
-                # ----------------------------------------------------------
-                with torch.autocast(device, enabled=False):
-                    yolo_bboxes: List[np.ndarray] = []
-                    yolo_kpt_counts: List[int] = []
-                    for r in yolo_model(
-                        frame_bgr, verbose=False,
-                        conf=yolo_conf_threshold, iou=0.7,
-                    ):
-                        for i, box in enumerate(r.boxes):
-                            if int(box.cls) == 0:  # person
-                                yolo_bboxes.append(
-                                    box.xyxy[0].cpu().numpy().astype(np.float32)
-                                )
-                                # Count keypoints with confidence > 0.3
-                                n_kpts = 0
-                                if (r.keypoints is not None
-                                        and r.keypoints.conf is not None
-                                        and i < len(r.keypoints.conf)):
-                                    n_kpts = int(
-                                        (r.keypoints.conf[i].cpu().numpy() > 0.3).sum()
-                                    )
-                                yolo_kpt_counts.append(n_kpts)
-
-                # ----------------------------------------------------------
-                # 4. New-person detection: SAM2 mask center-point check.
-                #
-                #    A YOLO detection is a NEW-PERSON CANDIDATE if:
-                #      (a) its center pixel is not inside any current SAM2 mask
-                #          (the masks are at original video resolution, so no
-                #          coordinate scaling is needed), AND
-                #      (b) it doesn't overlap (IoU ≥ 0.3) with the last known
-                #          bbox of any track whose SAM2 mask is currently
-                #          collapsed (lost tracks).
-                #
-                #    This is strictly spatial — no feature similarity needed.
-                #    SAM2 masks are precise enough that a new person entering
-                #    the scene will never have their center inside a tracked
-                #    person's mask, even in dense crowds.
-                # ----------------------------------------------------------
-                # Current visible SAM2 masks (precise person shapes)
-                current_masks: List[np.ndarray] = [
-                    res.mask
-                    for res in results.values()
-                    if res.is_visible and res.mask is not None
-                ]
-                # Last known bboxes for ALL active tracks — used as a safety
-                # net against re-registering a person whose SAM2 mask has
-                # temporarily collapsed.  We keep ALL tracks here (not just
-                # visibly-lost ones) with a low IoU threshold so a moving
-                # person is still matched even if their mask is partly gone.
-                all_track_bboxes: List[np.ndarray] = [
-                    info["last_bbox"]
-                    for info in active_objs.values()
-                    if "last_bbox" in info
-                ]
-
-                # Whether the model outputs pose keypoints at all
-                # (False for plain yolo11m.pt, True for yolo11m-pose.pt).
-                pose_model_active = any(c > 0 for c in yolo_kpt_counts)
-
-                new_candidate_indices: List[int] = []
-                for yi, bbox in enumerate(yolo_bboxes):
-                    cx = int((bbox[0] + bbox[2]) / 2)
-                    cy = int((bbox[1] + bbox[3]) / 2)
-
-                    # (a) center inside any current SAM2 mask?
-                    covered = any(
-                        0 <= cy < m.shape[0] and 0 <= cx < m.shape[1] and m[cy, cx]
-                        for m in current_masks
-                    )
-                    if covered:
-                        continue
-
-                    # (b) overlap with ANY active track's last known bbox?
-                    #     Low threshold (0.15) catches tracks whose mask
-                    #     collapsed but person only moved a little, preventing
-                    #     re-registration and the drifting phantom that follows.
-                    if all_track_bboxes:
-                        max_iou = max(self._box_iou(bbox, lb) for lb in all_track_bboxes)
-                        if max_iou >= 0.15:
-                            continue
-
-                    # (c) Pose-based shadow rejection.
-                    #     Shadows of people produce no valid body keypoints.
-                    #     Requires a pose model (e.g. yolo11m-pose.pt); falls
-                    #     through silently for plain detection models.
-                    if pose_model_active and yolo_kpt_counts[yi] < 3:
-                        continue
-
-                    new_candidate_indices.append(yi)
-
-                # ----------------------------------------------------------
-                # 7. Two-frame confirmation window.
-                # ----------------------------------------------------------
-                cand_bboxes = [yolo_bboxes[yi] for yi in new_candidate_indices]
-                pending_ref: Dict[int, np.ndarray] = {
-                    cid: info["bbox"] for cid, info in pending.items()
-                }
-                matched_pending, truly_new_local = self._match_detections(
-                    cand_bboxes, pending_ref, 0.3
+            with torch.autocast(device, enabled=False):
+                yolo_out = yolo_model(
+                    frame0_bgr, verbose=False,
+                    conf=yolo_conf_threshold, iou=0.7,
                 )
 
-                registered_new = False
-                for cid, local_yi in matched_pending.items():
-                    orig_yi = new_candidate_indices[local_yi]
-                    bbox    = yolo_bboxes[orig_yi]
-                    cx = float((bbox[0] + bbox[2]) / 2)
-                    cy = float((bbox[1] + bbox[3]) / 2)
-                    # Register the new person with SAM2.
-                    # add_new_points_or_box runs SAM2's decoder on frame_idx
-                    # and stores the initial conditioning mask internally —
-                    # no separate propagation call is needed for this frame.
-                    self._predictor.add_new_points_or_box(
-                        state,
-                        frame_idx=frame_idx,
-                        obj_id=next_obj_id,
-                        box=bbox,
-                        points=np.array([[cx, cy]], dtype=np.float32),
-                        labels=np.array([1], dtype=np.int32),
-                    )
-                    active_objs[next_obj_id] = {
-                        "last_seen": frame_idx,
-                        "last_bbox": bbox,
-                        "max_area": 0,  # will grow as masks are observed
-                    }
-                    next_obj_id  += 1
-                    registered_new = True
-                    del pending[cid]
+            registered_ids: set = set()
+            next_obj_id = 1
 
-                for local_yi in truly_new_local:
-                    orig_yi = new_candidate_indices[local_yi]
-                    pending[next_pend_id] = {
-                        "bbox":        yolo_bboxes[orig_yi],
-                        "first_frame": frame_idx,
-                    }
-                    next_pend_id += 1
+            for r in yolo_out:
+                _seg_data = None
+                if r.masks is not None and r.masks.data is not None:
+                    _seg_data = r.masks.data.cpu().numpy()  # (N, H_m, W_m)
 
-                stale_age = confirm_frames - 1
-                for cid in [
-                    cid for cid, info in pending.items()
-                    if frame_idx - info["first_frame"] >= stale_age
-                ]:
-                    del pending[cid]
+                for i, box in enumerate(r.boxes):
+                    if int(box.cls) != 0:
+                        continue
+                    bbox = box.xyxy[0].cpu().numpy().astype(np.float32)
 
-                # ----------------------------------------------------------
-                # 8. (Re)start the SAM2 propagation generator.
-                #    When a new person is registered SAM2 has their
-                #    conditioning mask at frame_idx; we restart from
-                #    frame_idx+1 so the next next() call picks them up via
-                #    the memory bank, exactly like single-person mode does
-                #    after the initial bbox prompt.
-                # ----------------------------------------------------------
-                if registered_new and active_objs:
-                    _prop_gen  = iter(self._predictor.propagate_in_video(
-                        state, start_frame_idx=frame_idx + 1
-                    ))
-                    _prop_next = frame_idx + 1
+                    seg_mask = None
+                    if _seg_data is not None and i < len(_seg_data):
+                        m = cv2.resize(
+                            _seg_data[i],
+                            (frame0_bgr.shape[1], frame0_bgr.shape[0]),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                        seg_mask = m > 0.5
 
-                # ----------------------------------------------------------
-                # 9. Expire stale objects.
-                # ----------------------------------------------------------
-                for oid in [
-                    oid for oid, info in active_objs.items()
-                    if frame_idx - info["last_seen"] > disappearance_timeout_frames
-                ]:
-                    del active_objs[oid]
+                    if seg_mask is not None:
+                        self._predictor.add_new_mask(
+                            state,
+                            frame_idx=0,
+                            obj_id=next_obj_id,
+                            mask=seg_mask,
+                        )
+                    else:
+                        cx = float((bbox[0] + bbox[2]) / 2)
+                        cy = float((bbox[1] + bbox[3]) / 2)
+                        self._predictor.add_new_points_or_box(
+                            state,
+                            frame_idx=0,
+                            obj_id=next_obj_id,
+                            box=bbox,
+                            points=np.array([[cx, cy]], dtype=np.float32),
+                            labels=np.array([1], dtype=np.int32),
+                        )
 
+                    registered_ids.add(next_obj_id)
+                    next_obj_id += 1
+
+            if not registered_ids:
+                print("[WARN] No persons detected in frame 0.")
+                for frame_idx in range(num_frames):
+                    yield frame_idx, {}
+                return
+
+            print(f"[INFO] Registered {len(registered_ids)} persons in frame 0.")
+
+            # ----------------------------------------------------------
+            # 2. Propagate through the full sequence using SAM2 memory bank.
+            # ----------------------------------------------------------
+            for frame_idx, obj_ids_out, masks_out in \
+                    self._predictor.propagate_in_video(state, start_frame_idx=0):
+                results: Dict[int, TrackResult] = {}
+                for i, oid in enumerate(obj_ids_out):
+                    if oid not in registered_ids:
+                        continue
+                    mask_np = (masks_out[i, 0] > 0.0).cpu().numpy()
+                    conf = self._compute_confidence(mask_np)
+                    results[oid] = self._make_result(mask_np, conf)
                 yield frame_idx, results
 
     # ------------------------------------------------------------------

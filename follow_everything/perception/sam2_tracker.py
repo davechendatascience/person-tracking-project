@@ -330,11 +330,13 @@ class SAM2Tracker:
                 #    Reference: last_yolo_bbox (same detector scale) with
                 #    last_bbox (SAM2 mask) as fallback when yolo ref is gone.
                 # ----------------------------------------------------------
-                active_ref: Dict[int, np.ndarray] = {
-                    oid: (info.get("last_yolo_bbox") or info["last_bbox"])
-                    for oid, info in active_objs.items()
-                    if (info.get("last_yolo_bbox") or info.get("last_bbox")) is not None
-                }
+                active_ref: Dict[int, np.ndarray] = {}
+                for oid, info in active_objs.items():
+                    ref = info.get("last_yolo_bbox")
+                    if ref is None:
+                        ref = info.get("last_bbox")
+                    if ref is not None:
+                        active_ref[oid] = ref
                 matched_active, unmatched_indices = self._match_detections(
                     yolo_bboxes, active_ref, iou_match_threshold
                 )

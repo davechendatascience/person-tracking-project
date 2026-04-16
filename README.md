@@ -55,20 +55,28 @@ python run_video.py --video data/test.mp4 --target-color red --no-reprompt
 
 # 手動限制回溯次數（優化長影片處理速度）
 python run_video.py --video data/test.mp4 --max-reprompts 1
+
+# 指定輸出影片路徑並開啟即時視覺化視窗
+python run_video.py --video data/test.mp4 --out-video results/my_result.mp4 --show
 ```
 
 ### 3. 可用參數
 *   `--video`: 影片檔案路徑。
+*   `--output`: 結果輸出目錄（預設：`results/video_mot17_11`）。
+*   `--start-frame`: 起始幀索引（預設：`0`）。
+*   `--num-frames`: 處理的幀數（預設：`300`）。
+*   `--yolo-model`: YOLO 模型路徑（預設：`yolo11m.pt`）。
 *   `--target-color`: `red`, `black`, 或 `any`。
-*   `--num-frames`: 處理的幀數。
 *   `--no-reprompt`: 禁用回溯功能（即時模式）。
-*   `--max-reprompts`: 設定最大回溯次數。
+*   `--max-reprompts`: 設定最大回溯次數（預設：`2`）。
+*   `--show`: 開啟即時視覺化視窗（按 `q` 退出）。
+*   `--out-video`: 指定輸出影片檔案路徑（預設儲存至 `<output>/tracking_result.mp4`）。
 
 ## 專案結構說明
 
 *   `follow_everything/perception/sam2_tracker.py`: 核心追蹤邏輯，負責處理緩衝區與 SAM2 呼叫。
 *   `run_video.py`: 影片追蹤的主要進入點，包含目標識別與影片匯出邏輯。
-*   `configs/follow_everything.yaml`: 追蹤器的超參數配置（信心度閾值、緩衝區大小等）。
+*   `configs/follow_everything.yaml`: 追蹤器的超參數配置（信心度閾值、緩衝區大小等）。預設使用 `sam2.1_hiera_tiny.pt` 以平衡速度與精度。
 
 ## 引用 (Reference)
 
@@ -84,4 +92,4 @@ python run_video.py --video data/test.mp4 --max-reprompts 1
 ```
 
 > [!NOTE]
-> 更多詳細的技術對照表與實驗結果請參閱 [analysis_results.md](file:///home/edge-host/.gemini/antigravity/brain/1efc6794-4350-4279-baee-01c4f94380b3/analysis_results.md)。
+> 更多詳細的技術對照表與實驗結果請參閱 `analysis_results.md`。

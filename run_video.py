@@ -108,6 +108,7 @@ def run_video_tracking():
     parser.add_argument("--no-reprompt", action="store_true", help="Disable re-propagation passes")
     parser.add_argument("--max-reprompts", type=int, default=2, help="Max number of re-propagation passes")
     parser.add_argument("--show", action="store_true", help="Show real-time visualization window")
+    parser.add_argument("--out-video", type=str, default=None, help="Designated output video file path")
     args = parser.parse_args()
 
     output_dir = Path(args.output)
@@ -191,7 +192,12 @@ def run_video_tracking():
 
     # 5. Run & Pipeline Tracking + Visualization + Video Export
     try:
-        video_out_path = output_dir / "tracking_result.mp4"
+        if args.out_video:
+            video_out_path = Path(args.out_video)
+            video_out_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            video_out_path = output_dir / "tracking_result.mp4"
+            
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         video_writer = None
         

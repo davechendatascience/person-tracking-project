@@ -1,8 +1,8 @@
 sam2:
   # relative to project root
-  checkpoint: "sam2.1_hiera_base_plus.pt"
+  checkpoint: "sam2.1_hiera_tiny.pt"
   # config key inside the SAM2 package (used by build_sam2_video_predictor)
-  model_cfg: "configs/sam2.1/sam2.1_hiera_b+.yaml"
+  model_cfg: "configs/sam2.1/sam2.1_hiera_t.yaml"
   device: "cuda"
 
 crowdbot:

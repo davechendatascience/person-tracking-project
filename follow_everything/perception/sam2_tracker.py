@@ -210,13 +210,13 @@ class SAM2Tracker:
                                 self._update_buffer(frame_idx, bbox, dist, conf)
                         
                         # Detect loss
-                        if conf < self._pcfg["min_mask_confidence"] and frame_idx > 0:
+                        if conf < self._pcfg["min_mask_confidence"]:
                             if lost_at is None:
                                 lost_at = frame_idx
                                 if not allow_reprompt: break
-                        elif lost_at is None and frame_idx > reprompt_from:
-                            lost_at = frame_idx
-                            if not allow_reprompt: pass
+                        else:
+                            # If we regain confidence, reset loss marker (for local jitters)
+                            lost_at = None
 
                 except StopIteration:
                     pass
@@ -233,8 +233,6 @@ class SAM2Tracker:
                         track_gen = self._predictor.propagate_in_video(state, start_frame_idx=reprompt_from)
                         continue
                 break  # done
-
-        return results
 
     # ------------------------------------------------------------------
     @staticmethod

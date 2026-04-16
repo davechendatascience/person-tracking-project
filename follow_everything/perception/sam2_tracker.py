@@ -344,17 +344,29 @@ class SAM2Tracker:
                             bbox = self._mask_to_bbox(mask_np)
                             if bbox is not None:
                                 active_objs[oid]["last_bbox"] = bbox
+                            # Track peak mask area so deduplication can
+                            # distinguish healthy masks from collapsed ones.
+                            mask_area = int(mask_np.sum())
+                            active_objs[oid]["max_area"] = max(
+                                active_objs[oid].get("max_area", 0), mask_area
+                            )
 
                 # ----------------------------------------------------------
                 # 2b. Mask-overlap deduplication.
-                #     If two tracked objects have highly overlapping segmentation
-                #     masks (overlap_coeff >= 0.8), discard the newer identity
-                #     (higher obj_id). This handles the re-registration ghost:
-                #     when a person's SAM2 mask temporarily collapses and they
-                #     get re-registered with a new ID, the new and old IDs will
-                #     both lock onto the same person — the overlap coefficient
-                #     catches this even when one mask is fully contained in the
-                #     other (unlike plain IoU which would be diluted).
+                #     If two tracked objects have highly similar segmentation
+                #     masks (IoU >= 0.8), discard the newer identity (higher
+                #     obj_id). This handles the re-registration ghost: when a
+                #     person's SAM2 mask temporarily collapses and they get
+                #     re-registered with a new ID, both IDs lock onto the same
+                #     body pixels → IoU ≈ 1.0. Two genuinely different people
+                #     have non-overlapping body pixels regardless of proximity,
+                #     so IoU stays low and they are never incorrectly merged.
+                #
+                #     Safety gate: only deduplicate when BOTH masks are >= 50%
+                #     of their historical peak area. Collapsed/drifted masks
+                #     (e.g. two people simultaneously occluded behind a third)
+                #     shrink well below this threshold, so their incidental
+                #     overlap never triggers a false removal.
                 # ----------------------------------------------------------
                 visible_oids = sorted(
                     [oid for oid, res in results.items()
@@ -368,6 +380,7 @@ class SAM2Tracker:
                     area_a = int(mask_a.sum())
                     if area_a == 0:
                         continue
+                    max_area_a = active_objs.get(oid_a, {}).get("max_area", area_a) or area_a
                     for oid_b in visible_oids[a_idx + 1:]:
                         if oid_b in to_remove:
                             continue
@@ -375,9 +388,15 @@ class SAM2Tracker:
                         area_b = int(mask_b.sum())
                         if area_b == 0:
                             continue
+                        # Skip if either mask has collapsed below 50% of its
+                        # historical peak — it's an occlusion artefact, not a ghost.
+                        max_area_b = active_objs.get(oid_b, {}).get("max_area", area_b) or area_b
+                        if area_a < 0.5 * max_area_a or area_b < 0.5 * max_area_b:
+                            continue
                         intersection = int((mask_a & mask_b).sum())
-                        overlap_coeff = intersection / min(area_a, area_b)
-                        if overlap_coeff >= 0.8:
+                        union = area_a + area_b - intersection
+                        mask_iou = intersection / union if union > 0 else 0.0
+                        if mask_iou >= 0.8:
                             to_remove.add(oid_b)  # discard newer (higher) ID
                 if to_remove:
                     for oid in to_remove:
@@ -511,6 +530,7 @@ class SAM2Tracker:
                     active_objs[next_obj_id] = {
                         "last_seen": frame_idx,
                         "last_bbox": bbox,
+                        "max_area": 0,  # will grow as masks are observed
                     }
                     next_obj_id  += 1
                     registered_new = True

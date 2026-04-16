@@ -111,6 +111,10 @@ def run_video_tracking():
     parser.add_argument("--out-video", type=str, default=None, help="Designated output video file path")
     parser.add_argument("--frame-stride", type=int, default=1,
                         help="Process every Nth frame (e.g. --frame-stride 2 halves frames and ~doubles throughput)")
+    parser.add_argument("--mode", type=str, default="single", choices=["single", "multi"],
+                        help="'single': track one person by color (default); 'multi': track all persons")
+    parser.add_argument("--disappearance-frames", type=int, default=300,
+                        help="Multi-mode only: drop a person after this many frames without detection (~10 s at 30 fps)")
     args = parser.parse_args()
 
     output_dir = Path(args.output)
@@ -141,20 +145,22 @@ def run_video_tracking():
     
     tracker = SAM2Tracker(cfg["perception"], cfg["sam2"])
     
-    # 3. Automatically find the "guy in red" in the first frame
-    first_frame_data = seq[args.start_frame]
-    if first_frame_data.image is None:
-        print("[ERROR] Could not load the first frame.")
-        return
+    # 3. Single-mode: identify the target person in the first frame by color.
+    target_box = None
+    if args.mode == "single":
+        first_frame_data = seq[args.start_frame]
+        if first_frame_data.image is None:
+            print("[ERROR] Could not load the first frame.")
+            return
 
-    print(f"[INFO] Identifying the person in {args.target_color} shirt...")
-    target_box = identify_person_by_color(first_frame_data.image, args.target_color, args.yolo_model)
-    
-    if target_box is None:
-        print("[ERROR] Could not find a person in red.")
-        return
-    
-    print(f"[INFO] Found target at {target_box}. Starting tracking...")
+        print(f"[INFO] Identifying the person in {args.target_color} shirt...")
+        target_box = identify_person_by_color(first_frame_data.image, args.target_color, args.yolo_model)
+
+        if target_box is None:
+            print("[ERROR] Could not find a person matching the target color.")
+            return
+
+        print(f"[INFO] Found target at {target_box}. Starting tracking...")
 
     # 4. Producer-Consumer Pipeline Setup
     import threading
@@ -234,35 +240,70 @@ def run_video_tracking():
             device=tracker._scfg["device"]
         )
 
-        print("[INFO] Starting synchronized tracking & visualization...")
-        tracker_gen = tracker.track_sequence(
-            loader,
-            np.array(target_box),
-            allow_reprompt=not args.no_reprompt,
-            max_reprompts=args.max_reprompts
-        )
+        # Per-person BGR colors (used in multi mode)
+        _PALETTE = [
+            (0,   0,   255),  # red
+            (0,   255, 0  ),  # green
+            (255, 0,   0  ),  # blue
+            (0,   255, 255),  # yellow
+            (255, 0,   255),  # magenta
+            (255, 255, 0  ),  # cyan
+            (0,   128, 255),  # orange
+            (128, 0,   255),  # violet
+        ]
 
-        for i, (f_idx, res) in enumerate(tqdm(tracker_gen, total=total_expected, desc="Pipelined Tracking")):
+        print("[INFO] Starting synchronized tracking & visualization...")
+
+        if args.mode == "single":
+            tracker_gen = tracker.track_sequence(
+                loader,
+                np.array(target_box),
+                allow_reprompt=not args.no_reprompt,
+                max_reprompts=args.max_reprompts,
+            )
+        else:
+            tracker_gen = tracker.track_sequence_multi(
+                loader,
+                yolo_model_path=args.yolo_model,
+                disappearance_timeout_frames=args.disappearance_frames,
+            )
+
+        for i, frame_output in enumerate(tqdm(tracker_gen, total=total_expected, desc="Tracking")):
+            # Unpack single vs multi yield shape
+            if args.mode == "single":
+                f_idx, res_single = frame_output
+                results_map = {1: res_single}
+            else:
+                f_idx, results_map = frame_output
+
             if f_idx >= len(img_paths): continue
-            # Load frame for visualization
             frame_path = img_paths[f_idx]
             viz_img = cv2.imread(str(frame_path))
             if viz_img is None: continue
 
-            # Apply Visualization
-            if res.is_visible and res.mask is not None:
-                mask = res.mask
-                colored_mask = np.zeros_like(viz_img)
-                colored_mask[mask] = [0, 0, 255] # Red in BGR
-                cv2.addWeighted(viz_img, 1.0, colored_mask, 0.4, 0, viz_img)
-                if res.centroid_uv:
-                    cx, cy = map(int, res.centroid_uv)
-                    cv2.drawMarker(viz_img, (cx, cy), (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
+            # Draw each tracked person
+            for obj_id, res in results_map.items():
+                color = _PALETTE[(obj_id - 1) % len(_PALETTE)]
+                if res.is_visible and res.mask is not None:
+                    colored_mask = np.zeros_like(viz_img)
+                    colored_mask[res.mask] = color
+                    cv2.addWeighted(viz_img, 1.0, colored_mask, 0.4, 0, viz_img)
+                    if res.centroid_uv:
+                        cx, cy = map(int, res.centroid_uv)
+                        cv2.drawMarker(viz_img, (cx, cy), color, cv2.MARKER_CROSS, 20, 2)
+                    if args.mode == "multi":
+                        bbox = tracker._mask_to_bbox(res.mask)
+                        if bbox is not None:
+                            x1, y1, x2, y2 = map(int, bbox)
+                            cv2.rectangle(viz_img, (x1, y1), (x2, y2), color, 2)
+                            cv2.putText(viz_img, f"P{obj_id}", (x1, y1 - 6),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-            if i == 0:
+            # First-frame target box label (single mode only)
+            if args.mode == "single" and i == 0 and target_box is not None:
                 x1, y1, x2, y2 = map(int, target_box)
                 cv2.rectangle(viz_img, (x1, y1), (x2, y2), (255, 0, 0), 2)
-                cv2.putText(viz_img, "Target Identified", (x1, y1-10),
+                cv2.putText(viz_img, "Target Identified", (x1, y1 - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
 
             cv2.putText(viz_img, f"Frame {frames_to_track[f_idx]}", (20, 40),
@@ -270,7 +311,7 @@ def run_video_tracking():
 
             # Show Window (Optional — must stay on main thread)
             if getattr(args, 'show', False):
-                cv2.imshow("Follow Everything Real-Time", viz_img)
+                cv2.imshow("Follow Everything", viz_img)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     args.show = False
                     stop_extraction.set()

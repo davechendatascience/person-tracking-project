@@ -114,6 +114,60 @@ class SAM2Tracker:
         self._temp_buf:   List[_BufferEntry] = []
 
     # ------------------------------------------------------------------
+    def _ensure_predictor(self) -> None:
+        """Build the SAM2 video predictor if not already initialised."""
+        if self._predictor is not None:
+            return
+        import torch
+        from sam2.build_sam import build_sam2_video_predictor
+        device = self._scfg["device"] if torch.cuda.is_available() else "cpu"
+        vos_optimized = self._scfg.get("vos_optimized", False)
+        if vos_optimized:
+            print("[INFO] Building VOS-optimized predictor (torch.compile warm-up on first run ~1-3 min)...")
+        self._predictor = build_sam2_video_predictor(
+            config_file=self._scfg["model_cfg"],
+            ckpt_path=self._scfg["checkpoint"],
+            device=device,
+            vos_optimized=vos_optimized,
+        )
+
+    def _build_inference_state(
+        self, frames_dir: Union[str, Path, "StreamingFrameLoader"]
+    ) -> dict:
+        """Construct an SAM2 inference state for a directory or StreamingFrameLoader.
+
+        Must be called inside a ``torch.inference_mode()`` context.
+        """
+        if not isinstance(frames_dir, StreamingFrameLoader):
+            return self._predictor.init_state(video_path=str(frames_dir))
+
+        state: dict = {}
+        state["images"]               = frames_dir
+        state["num_frames"]           = len(frames_dir)
+        state["offload_video_to_cpu"] = frames_dir.offload
+        state["offload_state_to_cpu"] = False
+        state["video_height"]         = frames_dir.video_height or 0
+        state["video_width"]          = frames_dir.video_width  or 0
+        state["device"]               = self._predictor.device
+        state["storage_device"]       = self._predictor.device
+        state["point_inputs_per_obj"]       = {}
+        state["mask_inputs_per_obj"]        = {}
+        state["cached_features"]            = {}
+        state["constants"]                  = {}
+        state["obj_id_to_idx"]              = OrderedDict()
+        state["obj_idx_to_id"]              = OrderedDict()
+        state["obj_ids"]                    = []
+        state["output_dict_per_obj"]        = {}
+        state["temp_output_dict_per_obj"]   = {}
+        state["frames_tracked_per_obj"]     = {}
+
+        # Warm up backbone and resolve actual frame dimensions.
+        self._predictor._get_image_feature(state, frame_idx=0, batch_size=1)
+        state["video_height"] = frames_dir.video_height
+        state["video_width"]  = frames_dir.video_width
+        return state
+
+    # ------------------------------------------------------------------
     def track_sequence(
         self,
         frames_dir:   Union[str, Path, StreamingFrameLoader],
@@ -128,58 +182,15 @@ class SAM2Tracker:
             Tuple of (frame_idx, TrackResult).
         """
         import torch
-        from sam2.build_sam import build_sam2_video_predictor
 
-        if self._predictor is None:
-            device = self._scfg["device"] if torch.cuda.is_available() else "cpu"
-            vos_optimized = self._scfg.get("vos_optimized", False)
-            if vos_optimized:
-                print("[INFO] Building VOS-optimized predictor (torch.compile warm-up on first run ~1-3 min)...")
-            self._predictor = build_sam2_video_predictor(
-                config_file=self._scfg["model_cfg"],
-                ckpt_path=self._scfg["checkpoint"],
-                device=device,
-                vos_optimized=vos_optimized,
-            )
-
+        self._ensure_predictor()
         self._dist_buf.clear()
         self._temp_buf.clear()
 
-        # Build inference state
         with torch.inference_mode(), \
              torch.autocast(self._scfg["device"], dtype=torch.bfloat16):
 
-            # Case 1: Standard directory (Offline)
-            if not isinstance(frames_dir, StreamingFrameLoader):
-                state = self._predictor.init_state(video_path=str(frames_dir))
-            else:
-                # Case 2: StreamingFrameLoader (Online)
-                state = {}
-                state["images"] = frames_dir
-                state["num_frames"] = len(frames_dir)
-                state["offload_video_to_cpu"] = frames_dir.offload
-                state["offload_state_to_cpu"] = False
-                state["video_height"] = frames_dir.video_height or 0
-                state["video_width"] = frames_dir.video_width or 0
-                state["device"] = self._predictor.device
-                state["storage_device"] = self._predictor.device
-                state["point_inputs_per_obj"] = {}
-                state["mask_inputs_per_obj"] = {}
-                state["cached_features"] = {}
-                state["constants"] = {}
-                state["obj_id_to_idx"] = OrderedDict()
-                state["obj_idx_to_id"] = OrderedDict()
-                state["obj_ids"] = []
-                state["output_dict_per_obj"] = {}
-                state["temp_output_dict_per_obj"] = {}
-                state["frames_tracked_per_obj"] = {}
-                
-                # Warm up visual backbone
-                self._predictor._get_image_feature(state, frame_idx=0, batch_size=1)
-                
-                # Sync height/width from loader after it loaded frame 0
-                state["video_height"] = frames_dir.video_height
-                state["video_width"] = frames_dir.video_width
+            state = self._build_inference_state(frames_dir)
 
             self._predictor.add_new_points_or_box(
                 state, frame_idx=0, obj_id=1,
@@ -237,6 +248,191 @@ class SAM2Tracker:
                         track_gen = self._predictor.propagate_in_video(state, start_frame_idx=reprompt_from)
                         continue
                 break  # done
+
+    # ------------------------------------------------------------------
+    def track_sequence_multi(
+        self,
+        frames_dir:   Union[str, Path, "StreamingFrameLoader"],
+        yolo_model_path: str = "yolo11m.pt",
+        disappearance_timeout_frames: int = 300,
+        iou_match_threshold: float = 0.3,
+    ) -> Iterator[Tuple[int, Dict[int, "TrackResult"]]]:
+        """Multi-person tracking: YOLO scans every frame for new persons,
+        SAM2 tracks all active persons simultaneously.
+
+        Persons absent for ``disappearance_timeout_frames`` consecutive frames
+        are dropped and their features cleared.
+
+        Yields:
+            Tuple of (frame_idx, {obj_id: TrackResult}).
+        """
+        import torch
+        from ultralytics import YOLO
+
+        self._ensure_predictor()
+        device = self._scfg["device"]
+        yolo_model = YOLO(yolo_model_path)
+
+        with torch.inference_mode(), \
+             torch.autocast(device, dtype=torch.bfloat16):
+
+            state = self._build_inference_state(frames_dir)
+            num_frames = state["num_frames"]
+
+            next_obj_id = 1
+            # active_objs: obj_id → {'last_seen': int, 'last_bbox': np.ndarray|None}
+            active_objs: Dict[int, dict] = {}
+
+            for frame_idx in range(num_frames):
+                # ----------------------------------------------------------
+                # 1. Obtain the raw BGR frame for YOLO (blocks until the
+                #    extraction worker has written the file to /dev/shm).
+                # ----------------------------------------------------------
+                if isinstance(frames_dir, StreamingFrameLoader):
+                    frame_bgr = self._wait_and_read_bgr(frames_dir.img_paths[frame_idx])
+                else:
+                    frame_bgr = cv2.imread(
+                        str(Path(frames_dir) / f"{frame_idx:06d}.jpg")
+                    )
+
+                if frame_bgr is None:
+                    yield frame_idx, {}
+                    continue
+
+                # ----------------------------------------------------------
+                # 2. YOLO detection — disable autocast so YOLO runs in its
+                #    native precision (avoids bfloat16 accuracy surprises).
+                # ----------------------------------------------------------
+                with torch.autocast(device, enabled=False):
+                    yolo_bboxes: List[np.ndarray] = []
+                    for r in yolo_model(frame_bgr, verbose=False):
+                        for box in r.boxes:
+                            if int(box.cls) == 0:  # person
+                                yolo_bboxes.append(
+                                    box.xyxy[0].cpu().numpy().astype(np.float32)
+                                )
+
+                # ----------------------------------------------------------
+                # 3. Match YOLO detections → active SAM2 objects by IoU.
+                #    Unmatched detections become new tracked persons.
+                # ----------------------------------------------------------
+                _, new_det_indices = self._match_detections(
+                    yolo_bboxes, active_objs, iou_match_threshold
+                )
+
+                for yi in new_det_indices:
+                    self._predictor.add_new_points_or_box(
+                        state,
+                        frame_idx=frame_idx,
+                        obj_id=next_obj_id,
+                        box=yolo_bboxes[yi],
+                    )
+                    active_objs[next_obj_id] = {
+                        "last_seen": frame_idx,
+                        "last_bbox": yolo_bboxes[yi],
+                    }
+                    next_obj_id += 1
+
+                # ----------------------------------------------------------
+                # 4. Run SAM2 for this single frame across all active objects.
+                # ----------------------------------------------------------
+                results: Dict[int, TrackResult] = {}
+                if active_objs:
+                    for _, obj_ids_out, masks_out in self._predictor.propagate_in_video(
+                        state,
+                        start_frame_idx=frame_idx,
+                        max_frame_num_to_track=1,
+                    ):
+                        for i, oid in enumerate(obj_ids_out):
+                            if oid not in active_objs:
+                                continue  # already expired
+                            mask_np = (masks_out[i, 0] > 0.0).cpu().numpy()
+                            conf    = self._compute_confidence(mask_np)
+                            res     = self._make_result(mask_np, conf)
+                            results[oid] = res
+                            if res.is_visible:
+                                active_objs[oid]["last_seen"] = frame_idx
+                                bbox = self._mask_to_bbox(mask_np)
+                                if bbox is not None:
+                                    active_objs[oid]["last_bbox"] = bbox
+
+                # ----------------------------------------------------------
+                # 5. Expire objects gone longer than the timeout.
+                # ----------------------------------------------------------
+                expired = [
+                    oid for oid, info in active_objs.items()
+                    if frame_idx - info["last_seen"] > disappearance_timeout_frames
+                ]
+                for oid in expired:
+                    del active_objs[oid]
+                    # SAM2 state entries for expired objects remain but their
+                    # results are ignored; removing them from obj_id_to_idx
+                    # would require re-indexing and is intentionally skipped.
+
+                yield frame_idx, results
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _wait_and_read_bgr(path: Path, timeout: float = 60.0) -> Optional[np.ndarray]:
+        """Block until ``path`` exists (written by the extraction thread), then read it."""
+        wait_start = time.time()
+        while not path.exists():
+            if time.time() - wait_start > timeout:
+                return None
+            time.sleep(0.01)
+        return cv2.imread(str(path))
+
+    @staticmethod
+    def _box_iou(a: np.ndarray, b: np.ndarray) -> float:
+        """IoU between two [x1, y1, x2, y2] boxes."""
+        ix1 = max(a[0], b[0]);  iy1 = max(a[1], b[1])
+        ix2 = min(a[2], b[2]);  iy2 = min(a[3], b[3])
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        if inter == 0.0:
+            return 0.0
+        area_a = (a[2] - a[0]) * (a[3] - a[1])
+        area_b = (b[2] - b[0]) * (b[3] - b[1])
+        return float(inter / (area_a + area_b - inter))
+
+    @staticmethod
+    def _match_detections(
+        yolo_bboxes: List[np.ndarray],
+        active_objs: Dict[int, dict],
+        iou_threshold: float,
+    ) -> Tuple[Dict[int, int], List[int]]:
+        """Greedy IoU matching between YOLO detections and active tracked objects.
+
+        Returns:
+            matched:          {obj_id → yolo_index} for matched pairs
+            new_det_indices:  yolo indices with no match (new persons)
+        """
+        if not yolo_bboxes:
+            return {}, []
+
+        obj_ids = [
+            oid for oid, info in active_objs.items()
+            if info.get("last_bbox") is not None
+        ]
+        if not obj_ids:
+            return {}, list(range(len(yolo_bboxes)))
+
+        iou_mat = np.zeros((len(yolo_bboxes), len(obj_ids)), dtype=np.float32)
+        for i, yb in enumerate(yolo_bboxes):
+            for j, oid in enumerate(obj_ids):
+                iou_mat[i, j] = SAM2Tracker._box_iou(yb, active_objs[oid]["last_bbox"])
+
+        matched: Dict[int, int] = {}
+        used_yolo: set = set()
+        used_obj:  set = set()
+
+        while iou_mat.max() >= iou_threshold:
+            yi, oi = np.unravel_index(iou_mat.argmax(), iou_mat.shape)
+            matched[obj_ids[oi]] = int(yi)
+            used_yolo.add(int(yi));  used_obj.add(int(oi))
+            iou_mat[yi, :] = -1.0;  iou_mat[:, oi] = -1.0
+
+        new_det_indices = [i for i in range(len(yolo_bboxes)) if i not in used_yolo]
+        return matched, new_det_indices
 
     # ------------------------------------------------------------------
     @staticmethod

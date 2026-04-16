@@ -1,8 +1,8 @@
 sam2:
   # relative to project root
-  checkpoint: "sam2.1_hiera_tiny.pt"
+  checkpoint: "sam2.1_hiera_large.pt"
   # config key inside the SAM2 package (used by build_sam2_video_predictor)
-  model_cfg: "configs/sam2.1/sam2.1_hiera_t.yaml"
+  model_cfg: "configs/sam2.1/sam2.1_hiera_l.yaml"
   device: "cuda"
   # Compile memory_attention, memory_encoder, prompt_encoder, and mask_decoder
   # with torch.compile(mode="max-autotune"). First run compiles (~1-3 min) then

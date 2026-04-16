@@ -69,7 +69,7 @@ python run_video.py --video data/test.mp4 --frame-stride 2
 *   `--start-frame`: 起始幀索引（預設：`0`）。
 *   `--num-frames`: 處理的幀數（預設：`300`）。
 *   `--yolo-model`: YOLO 模型路徑（預設：`yolo11m.pt`）。
-*   `--target-color`: `red`, `black`, 或 `any`。
+*   `--target-color`: `red`, `black`, `any`, 或 `random`（從偵測到的所有人中隨機選取一人）。
 *   `--no-reprompt`: 禁用回溯功能（即時模式）。
 *   `--max-reprompts`: 設定最大回溯次數（預設：`2`）。
 *   `--show`: 開啟即時視覺化視窗（按 `q` 退出）。
@@ -113,4 +113,4 @@ sam2:
 ```
 
 > [!NOTE]
-> 更多詳細的技術對照表與實驗結果請參閱 `analysis_results.md`。
+> 更多詳細的技術對照表與實驗結果請參閱 [`analysis_paper.md`](analysis_paper.md)。

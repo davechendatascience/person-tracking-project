@@ -114,7 +114,11 @@ def run_video_tracking():
     parser.add_argument("--mode", type=str, default="single", choices=["single", "multi"],
                         help="'single': track one person by color (default); 'multi': track all persons")
     parser.add_argument("--disappearance-frames", type=int, default=300,
-                        help="Multi-mode only: drop a person after this many frames without detection (~10 s at 30 fps)")
+                        help="Multi-mode: drop a person after this many frames without detection (~10 s at 30 fps)")
+    parser.add_argument("--yolo-conf", type=float, default=0.45,
+                        help="Multi-mode: YOLO confidence threshold for person detection (default 0.45)")
+    parser.add_argument("--confirm-frames", type=int, default=2,
+                        help="Multi-mode: frames a new detection must appear before SAM2 starts tracking it (default 2)")
     args = parser.parse_args()
 
     output_dir = Path(args.output)
@@ -266,6 +270,8 @@ def run_video_tracking():
                 loader,
                 yolo_model_path=args.yolo_model,
                 disappearance_timeout_frames=args.disappearance_frames,
+                yolo_conf_threshold=args.yolo_conf,
+                confirm_frames=args.confirm_frames,
             )
 
         for i, frame_output in enumerate(tqdm(tracker_gen, total=total_expected, desc="Tracking")):

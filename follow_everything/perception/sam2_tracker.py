@@ -256,12 +256,18 @@ class SAM2Tracker:
         yolo_model_path: str = "yolo11m.pt",
         disappearance_timeout_frames: int = 300,
         iou_match_threshold: float = 0.3,
+        yolo_conf_threshold: float = 0.45,
+        confirm_frames: int = 2,
     ) -> Iterator[Tuple[int, Dict[int, "TrackResult"]]]:
         """Multi-person tracking: YOLO scans every frame for new persons,
         SAM2 tracks all active persons simultaneously.
 
+        Two-stage registration: a new YOLO detection must appear in
+        ``confirm_frames`` consecutive frames before SAM2 starts tracking it,
+        which suppresses one-frame YOLO false positives.
+
         Persons absent for ``disappearance_timeout_frames`` consecutive frames
-        are dropped and their features cleared.
+        are dropped.
 
         Yields:
             Tuple of (frame_idx, {obj_id: TrackResult}).
@@ -279,14 +285,16 @@ class SAM2Tracker:
             state = self._build_inference_state(frames_dir)
             num_frames = state["num_frames"]
 
-            next_obj_id = 1
-            # active_objs: obj_id → {'last_seen': int, 'last_bbox': np.ndarray|None}
+            next_obj_id  = 1
+            next_pend_id = 0
+            # active_objs: obj_id → {last_seen, last_bbox (SAM2 mask), last_yolo_bbox}
             active_objs: Dict[int, dict] = {}
+            # pending: cand_id → {bbox, first_frame}  — awaiting confirmation
+            pending: Dict[int, dict] = {}
 
             for frame_idx in range(num_frames):
                 # ----------------------------------------------------------
-                # 1. Obtain the raw BGR frame for YOLO (blocks until the
-                #    extraction worker has written the file to /dev/shm).
+                # 1. Obtain the raw BGR frame for YOLO.
                 # ----------------------------------------------------------
                 if isinstance(frames_dir, StreamingFrameLoader):
                     frame_bgr = self._wait_and_read_bgr(frames_dir.img_paths[frame_idx])
@@ -300,12 +308,17 @@ class SAM2Tracker:
                     continue
 
                 # ----------------------------------------------------------
-                # 2. YOLO detection — disable autocast so YOLO runs in its
-                #    native precision (avoids bfloat16 accuracy surprises).
+                # 2. YOLO detection.
+                #    • conf threshold filters low-confidence detections
+                #    • iou=0.45 makes YOLO's NMS more aggressive so a single
+                #      person doesn't produce two overlapping boxes
                 # ----------------------------------------------------------
                 with torch.autocast(device, enabled=False):
                     yolo_bboxes: List[np.ndarray] = []
-                    for r in yolo_model(frame_bgr, verbose=False):
+                    for r in yolo_model(
+                        frame_bgr, verbose=False,
+                        conf=yolo_conf_threshold, iou=0.45
+                    ):
                         for box in r.boxes:
                             if int(box.cls) == 0:  # person
                                 yolo_bboxes.append(
@@ -313,28 +326,73 @@ class SAM2Tracker:
                                 )
 
                 # ----------------------------------------------------------
-                # 3. Match YOLO detections → active SAM2 objects by IoU.
-                #    Unmatched detections become new tracked persons.
+                # 3. Match YOLO detections → active SAM2 objects.
+                #    Reference: last_yolo_bbox (same detector scale) with
+                #    last_bbox (SAM2 mask) as fallback when yolo ref is gone.
                 # ----------------------------------------------------------
-                _, new_det_indices = self._match_detections(
-                    yolo_bboxes, active_objs, iou_match_threshold
+                active_ref: Dict[int, np.ndarray] = {
+                    oid: (info.get("last_yolo_bbox") or info["last_bbox"])
+                    for oid, info in active_objs.items()
+                    if (info.get("last_yolo_bbox") or info.get("last_bbox")) is not None
+                }
+                matched_active, unmatched_indices = self._match_detections(
+                    yolo_bboxes, active_ref, iou_match_threshold
+                )
+                # Keep last_yolo_bbox fresh for matched objects
+                for oid, yi in matched_active.items():
+                    active_objs[oid]["last_yolo_bbox"] = yolo_bboxes[yi]
+
+                # ----------------------------------------------------------
+                # 4. Two-frame confirmation window.
+                #    Unmatched YOLO detections are checked against pending
+                #    candidates. A second hit on the same candidate promotes
+                #    it to an active SAM2 object; first-time detections just
+                #    enter pending and wait.
+                # ----------------------------------------------------------
+                unmatched_bboxes = [yolo_bboxes[yi] for yi in unmatched_indices]
+                pending_ref: Dict[int, np.ndarray] = {
+                    cid: info["bbox"] for cid, info in pending.items()
+                }
+                matched_pending, truly_new_local = self._match_detections(
+                    unmatched_bboxes, pending_ref, iou_match_threshold
                 )
 
-                for yi in new_det_indices:
+                # Confirmed candidates → register with SAM2
+                for cid, local_yi in matched_pending.items():
+                    orig_yi = unmatched_indices[local_yi]
                     self._predictor.add_new_points_or_box(
                         state,
                         frame_idx=frame_idx,
                         obj_id=next_obj_id,
-                        box=yolo_bboxes[yi],
+                        box=yolo_bboxes[orig_yi],
                     )
                     active_objs[next_obj_id] = {
-                        "last_seen": frame_idx,
-                        "last_bbox": yolo_bboxes[yi],
+                        "last_seen":      frame_idx,
+                        "last_bbox":      yolo_bboxes[orig_yi],
+                        "last_yolo_bbox": yolo_bboxes[orig_yi],
                     }
                     next_obj_id += 1
+                    del pending[cid]
+
+                # Truly new detections → enter pending
+                for local_yi in truly_new_local:
+                    orig_yi = unmatched_indices[local_yi]
+                    pending[next_pend_id] = {
+                        "bbox":        yolo_bboxes[orig_yi],
+                        "first_frame": frame_idx,
+                    }
+                    next_pend_id += 1
+
+                # Drop stale pending entries that were never re-detected
+                stale_age = confirm_frames - 1
+                for cid in [
+                    cid for cid, info in pending.items()
+                    if frame_idx - info["first_frame"] >= stale_age
+                ]:
+                    del pending[cid]
 
                 # ----------------------------------------------------------
-                # 4. Run SAM2 for this single frame across all active objects.
+                # 5. Run SAM2 for this single frame across all active objects.
                 # ----------------------------------------------------------
                 results: Dict[int, TrackResult] = {}
                 if active_objs:
@@ -357,7 +415,7 @@ class SAM2Tracker:
                                     active_objs[oid]["last_bbox"] = bbox
 
                 # ----------------------------------------------------------
-                # 5. Expire objects gone longer than the timeout.
+                # 6. Expire objects gone longer than the timeout.
                 # ----------------------------------------------------------
                 expired = [
                     oid for oid, info in active_objs.items()
@@ -365,9 +423,6 @@ class SAM2Tracker:
                 ]
                 for oid in expired:
                     del active_objs[oid]
-                    # SAM2 state entries for expired objects remain but their
-                    # results are ignored; removing them from obj_id_to_idx
-                    # would require re-indexing and is intentionally skipped.
 
                 yield frame_idx, results
 
@@ -396,43 +451,42 @@ class SAM2Tracker:
 
     @staticmethod
     def _match_detections(
-        yolo_bboxes: List[np.ndarray],
-        active_objs: Dict[int, dict],
+        query_bboxes: List[np.ndarray],
+        ref_bboxes: Dict[int, np.ndarray],
         iou_threshold: float,
     ) -> Tuple[Dict[int, int], List[int]]:
-        """Greedy IoU matching between YOLO detections and active tracked objects.
+        """Greedy IoU matching: query boxes vs. a reference dict of boxes.
+
+        Args:
+            query_bboxes:  list of [x1,y1,x2,y2] boxes to assign
+            ref_bboxes:    {id → [x1,y1,x2,y2]} existing tracked positions
+            iou_threshold: minimum IoU to accept a match
 
         Returns:
-            matched:          {obj_id → yolo_index} for matched pairs
-            new_det_indices:  yolo indices with no match (new persons)
+            matched:   {ref_id → query_index} for accepted pairs
+            unmatched: query indices that had no match
         """
-        if not yolo_bboxes:
-            return {}, []
+        if not query_bboxes or not ref_bboxes:
+            return {}, list(range(len(query_bboxes)))
 
-        obj_ids = [
-            oid for oid, info in active_objs.items()
-            if info.get("last_bbox") is not None
-        ]
-        if not obj_ids:
-            return {}, list(range(len(yolo_bboxes)))
-
-        iou_mat = np.zeros((len(yolo_bboxes), len(obj_ids)), dtype=np.float32)
-        for i, yb in enumerate(yolo_bboxes):
-            for j, oid in enumerate(obj_ids):
-                iou_mat[i, j] = SAM2Tracker._box_iou(yb, active_objs[oid]["last_bbox"])
+        ref_ids = list(ref_bboxes.keys())
+        iou_mat = np.zeros((len(query_bboxes), len(ref_ids)), dtype=np.float32)
+        for i, qb in enumerate(query_bboxes):
+            for j, rid in enumerate(ref_ids):
+                iou_mat[i, j] = SAM2Tracker._box_iou(qb, ref_bboxes[rid])
 
         matched: Dict[int, int] = {}
-        used_yolo: set = set()
-        used_obj:  set = set()
+        used_q: set = set()
+        used_r: set = set()
 
         while iou_mat.max() >= iou_threshold:
-            yi, oi = np.unravel_index(iou_mat.argmax(), iou_mat.shape)
-            matched[obj_ids[oi]] = int(yi)
-            used_yolo.add(int(yi));  used_obj.add(int(oi))
-            iou_mat[yi, :] = -1.0;  iou_mat[:, oi] = -1.0
+            qi, ri = np.unravel_index(iou_mat.argmax(), iou_mat.shape)
+            matched[ref_ids[ri]] = int(qi)
+            used_q.add(int(qi));  used_r.add(int(ri))
+            iou_mat[qi, :] = -1.0;  iou_mat[:, ri] = -1.0
 
-        new_det_indices = [i for i in range(len(yolo_bboxes)) if i not in used_yolo]
-        return matched, new_det_indices
+        unmatched = [i for i in range(len(query_bboxes)) if i not in used_q]
+        return matched, unmatched
 
     # ------------------------------------------------------------------
     @staticmethod

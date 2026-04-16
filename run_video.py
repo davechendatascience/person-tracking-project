@@ -10,16 +10,36 @@ import tempfile
 import shutil
 import yaml
 import os
+import random
 import torch
 
 from crowdbot.dataset import VideoSequence
 from follow_everything.perception.sam2_tracker import SAM2Tracker
 
 def identify_person_by_color(image_rgb, color='red', model_path='yolo11m.pt'):
-    """Find the person matching the target color."""
+    """Find the person matching the target color, or a random person if color='random'."""
     image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-    
+
+    if color == 'random':
+        model = YOLO(model_path)
+        results = model(image_bgr, verbose=False)
+        persons = []
+        for r in results:
+            for box in r.boxes:
+                if int(box.cls) == 0:
+                    persons.append(box.xyxy[0].cpu().numpy())
+        print(f"Found {len(persons)} people candidates.")
+        if not persons:
+            return None
+        img_h, img_w = image_rgb.shape[:2]
+        chosen = random.choice(persons)
+        x1, y1, x2, y2 = map(int, chosen)
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(img_w, x2), min(img_h, y2)
+        print(f"  Randomly selected: box=[{x1}, {y1}, {x2}, {y2}]")
+        return [x1, y1, x2, y2]
+
     if color == 'red':
         lower_red1 = np.array([0, 70, 50])
         upper_red1 = np.array([10, 255, 255])
@@ -104,7 +124,7 @@ def run_video_tracking():
     parser.add_argument("--start-frame", type=int, default=0)
     parser.add_argument("--num-frames", type=int, default=300)
     parser.add_argument("--yolo-model", type=str, default="yolo11m.pt")
-    parser.add_argument("--target-color", type=str, default="red", choices=["red", "black", "any"])
+    parser.add_argument("--target-color", type=str, default="red", choices=["red", "black", "any", "random"])
     parser.add_argument("--no-reprompt", action="store_true", help="Disable re-propagation passes")
     parser.add_argument("--max-reprompts", type=int, default=2, help="Max number of re-propagation passes")
     parser.add_argument("--show", action="store_true", help="Show real-time visualization window")

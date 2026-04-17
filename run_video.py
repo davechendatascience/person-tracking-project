@@ -139,6 +139,8 @@ def run_video_tracking():
                         help="Multi-mode: YOLO confidence threshold for person detection (default 0.45)")
     parser.add_argument("--confirm-frames", type=int, default=2,
                         help="Multi-mode: frames a new detection must appear before SAM2 starts tracking it (default 2)")
+    parser.add_argument("--out-width", type=int, default=1280,
+                        help="Resize output video frames to this width (preserving aspect ratio). 0 = no resize (default 1280)")
     args = parser.parse_args()
 
     output_dir = Path(args.output)
@@ -332,6 +334,12 @@ def run_video_tracking():
 
             cv2.putText(viz_img, f"Frame {frames_to_track[f_idx]}", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+
+            # Resize output frame if requested
+            if args.out_width > 0 and viz_img.shape[1] > args.out_width:
+                scale = args.out_width / viz_img.shape[1]
+                out_h = int(viz_img.shape[0] * scale)
+                viz_img = cv2.resize(viz_img, (args.out_width, out_h), interpolation=cv2.INTER_AREA)
 
             # Show Window (Optional — must stay on main thread)
             if getattr(args, 'show', False):

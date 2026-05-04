@@ -1,0 +1,22 @@
+services:
+  sim:
+    build: .
+    image: follow_everything_nav2_3d:latest
+    container_name: follow_everything_nav2_3d
+    network_mode: host
+    ipc: host
+    privileged: true
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - XAUTHORITY=/tmp/.docker.xauth
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /tmp/.docker.xauth:/tmp/.docker.xauth:rw
+      - .:/ws
+    working_dir: /ws
+    stdin_open: true
+    tty: true
+    command: bash

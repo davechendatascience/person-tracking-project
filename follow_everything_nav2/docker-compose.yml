@@ -1,0 +1,49 @@
+services:
+  # Headless service for evaluation runs.
+  sim:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: autoresearch/leader-follow:latest
+    container_name: autoresearch-sim
+    network_mode: host
+    ipc: host
+    volumes:
+      - .:/ws
+    working_dir: /ws
+    environment:
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      - ROS_DOMAIN_ID=42
+      - MPLBACKEND=Agg            # headless matplotlib
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 4G
+    stdin_open: true
+    tty: true
+    command: ["bash"]
+
+  # Visual service: same image, X11 forwarded so the matplotlib window appears
+  # on the host display. On WSLg (Windows 11 + WSL2), the host /tmp/.X11-unix
+  # socket is itself a bind into /mnt/wslg, so we mount BOTH so the socket
+  # resolves inside the container.
+  #   docker compose run --rm sim-viz python3 -m eval.run_episode --render ...
+  sim-viz:
+    extends:
+      service: sim
+    container_name: autoresearch-sim-viz
+    environment:
+      - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+      - ROS_DOMAIN_ID=42
+      - DISPLAY=${DISPLAY:-:0}
+      - WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}
+      - XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir
+      - PULSE_SERVER=/mnt/wslg/PulseServer
+      - QT_X11_NO_MITSHM=1
+      - MPLBACKEND=TkAgg
+      - SIM_RENDER=1
+    volumes:
+      - .:/ws
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /mnt/wslg:/mnt/wslg:rw

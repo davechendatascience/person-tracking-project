@@ -1,0 +1,16 @@
+<!--
+Behavior Tree for the leader-following task.
+This is the FILE THE AUTORESEARCH AGENT EDITS.
+
+Stub: an empty BT that just keeps the robot still. The agent should design a
+real tree using Nav2 BT plugins (NavigateToPose, RecoveryNode, ComputePathToPose,
+FollowPath, Spin, BackUp, Wait) plus its own custom plugin nodes for perception
+filtering and recovery logic.
+
+Reference: https://navigation.ros.org/behavior_trees/index.html
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <AlwaysSuccess />
+  </BehaviorTree>
+</root>

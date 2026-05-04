@@ -12,6 +12,7 @@ import yaml
 import os
 import random
 import torch
+import subprocess
 
 from crowdbot.dataset import VideoSequence
 from follow_everything.perception.sam2_tracker import SAM2Tracker
@@ -230,30 +231,80 @@ def run_video_tracking():
 
     if args.out_video:
         video_out_path = Path(args.out_video)
+        if not video_out_path.suffix:
+            video_out_path = video_out_path.with_suffix(".mp4")
         video_out_path.parent.mkdir(parents=True, exist_ok=True)
     else:
         video_out_path = output_dir / "tracking_result.mp4"
 
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    def _reencode_video(path):
+        """Re-encode video to H.264 using ffmpeg for maximum compatibility."""
+        temp_path = path.with_suffix(".temp.mp4")
+        path.rename(temp_path)
+        print(f"[INFO] Re-encoding video to H.264 for compatibility...")
+        try:
+            # Use libx264 explicitly to avoid hardware encoder issues
+            cmd = [
+                "ffmpeg", "-y", "-i", str(temp_path),
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart", str(path)
+            ]
+            subprocess.run(cmd, check=True, capture_output=True)
+            temp_path.unlink()
+            print(f"[INFO] Re-encoding complete.")
+        except Exception as e:
+            print(f"[WARNING] Re-encoding failed: {e}. Keeping original.")
+            if not path.exists() and temp_path.exists():
+                temp_path.rename(path)
 
+    # We'll try multiple codecs to ensure compatibility (e.g. 'mp4v' is more reliable on Linux)
+    codecs_to_try = ['mp4v', 'avc1', 'XVID']
+    
     # Async write thread: offloads cv2.imwrite + H.264 encoding off SAM2's critical path
-    _write_q = _queue.Queue(maxsize=16)
+    _write_q = _queue.Queue(maxsize=32)
 
     def _write_worker():
         _vw = None
+        target_size = None
+        frames_written = 0
         while True:
             item = _write_q.get()
             if item is None:
                 break
             frame_img, orig_frame_num = item
             cv2.imwrite(str(viz_dir / f"{orig_frame_num:06d}.jpg"), frame_img)
+            
+            h, w = frame_img.shape[:2]
             if _vw is None:
-                h, w = frame_img.shape[:2]
-                _vw = cv2.VideoWriter(str(video_out_path), fourcc, 30.0, (w, h))
-            _vw.write(frame_img)
+                target_size = (w, h)
+                for codec in codecs_to_try:
+                    fourcc = cv2.VideoWriter_fourcc(*codec)
+                    _vw = cv2.VideoWriter(str(video_out_path), fourcc, 30.0, target_size)
+                    if _vw.isOpened():
+                        print(f"[INFO] Initialized VideoWriter with codec: {codec}")
+                        break
+                    else:
+                        print(f"[WARNING] Failed to initialize VideoWriter with codec: {codec}")
+                        _vw = None
+                
+                if _vw is None:
+                    print(f"[ERROR] All video codecs failed. Video output disabled.")
+            
+            if _vw is not None and (w, h) == target_size:
+                _vw.write(frame_img)
+                frames_written += 1
+            elif _vw is not None:
+                print(f"[WARNING] Skipping frame {orig_frame_num} due to size mismatch: {(w, h)} vs {target_size}")
+            
             _write_q.task_done()
+        
         if _vw:
             _vw.release()
+            print(f"[INFO] Video saved to {video_out_path} ({frames_written} frames)")
+            
+            # If we used a fallback or the user reported issues, re-encode
+            # Here we always re-encode if we didn't get avc1, or just always for safety
+            _reencode_video(video_out_path)
 
     _write_thread = threading.Thread(target=_write_worker, daemon=False)
     _write_thread.start()

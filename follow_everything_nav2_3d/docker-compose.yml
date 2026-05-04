@@ -6,16 +6,33 @@ services:
     network_mode: host
     ipc: host
     privileged: true
+    runtime: nvidia
     environment:
       - DISPLAY=${DISPLAY}
       - QT_X11_NO_MITSHM=1
       - XAUTHORITY=/tmp/.docker.xauth
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       - /tmp/.docker.xauth:/tmp/.docker.xauth:rw
+      # follow_everything_nav2_3d itself
       - .:/ws
+      # ML payloads from the parent repo (read-only). Mounted under /opt/ so
+      # Docker doesn't auto-create empty stub mountpoints inside the host's
+      # follow_everything_nav2_3d/ directory. PYTHONPATH in the Dockerfile +
+      # the `_DEPS_ROOT` constant in dam4sam_tracker.py both point here.
+      - ../DAM4SAM:/opt/DAM4SAM:ro
+      - ../follow_everything:/opt/follow_everything:ro
+      - ../sam2.1_hiera_large.pt:/opt/sam2.1_hiera_large.pt:ro
+      - ../yolo11m.pt:/opt/yolo11m.pt:ro
     working_dir: /ws
     stdin_open: true
     tty: true

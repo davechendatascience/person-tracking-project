@@ -64,10 +64,14 @@ for _p in ("/ws", "/opt", "/opt/DAM4SAM"):
 
 # ---------------------------------------------------------------------------
 SAM2_CFG = {
-    # The DAM4SAM repo ships its own sam21pp_*.yaml configs alongside
-    # /opt/DAM4SAM/sam2/. We load the SAM2 1.0 plus-plus large variant.
-    "model_cfg":  "sam21pp_hiera_l.yaml",
-    "checkpoint": "/opt/sam2.1_hiera_large.pt",
+    # DAM4SAM ships its own sam21pp_*.yaml configs alongside /opt/DAM4SAM/sam2/.
+    # We use the small (S) variant — ~3× faster than large at the cost of
+    # slightly weaker masks. With a 320×240 camera and a sim actor that's
+    # already low-detail, the smaller model's spatial accuracy is fine and
+    # the higher tracker rate (~7-8 Hz vs ~2.5 Hz) cuts the temporal lag
+    # the BT sees on `last_seen`.
+    "model_cfg":  "sam21pp_hiera_s.yaml",
+    "checkpoint": "/opt/sam2.1_hiera_small.pt",
     "device":     "cuda",
     "image_size": 1024,
 }

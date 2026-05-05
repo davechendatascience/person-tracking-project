@@ -91,6 +91,14 @@ YOLO_WEIGHTS = "/opt/yolo11m.pt"
 YOLO_CONF    = 0.5
 PERSON_CLS   = 0  # COCO
 
+# Camera mount on the chassis (must match sim/worlds/empty.world's
+# rgbd_camera sensor pose AND sim/python/oracle_camera.py). Used by the
+# hardcoded optical→base_link transform: the gz bridge does NOT publish
+# follower/camera_optical_frame in /tf, so TF lookup fails. Same trick
+# the oracle uses — bypass TF, rely on URDF-fixed offsets.
+CAM_OFFSET_X_BODY = 0.23
+CAM_OFFSET_Z_BODY = 0.15
+
 # Pre-allocated paths for the loader; SAM2 stops when this many frames have
 # been processed. At ~5 Hz that's ~5.5 hours; plenty for a Phase 4 demo.
 MAX_FRAMES = 100_000
@@ -639,8 +647,8 @@ class Dam4SamTracker(Node):
             tint[mask > 0] = (tint[mask > 0] * 0.5 + np.array([255, 60, 60]) * 0.5).astype(np.uint8)
             vis = tint
             if result.centroid_uv is not None:
-                u_s = int(float(result.centroid_uv[0]) * w / SAM2_CFG["image_size"])
-                v_s = int(float(result.centroid_uv[1]) * h / SAM2_CFG["image_size"])
+                u_s = int(float(result.centroid_uv[0]))
+                v_s = int(float(result.centroid_uv[1]))
                 cv2.circle(vis, (u_s, v_s), 6, (0, 255, 0), -1)
                 cv2.circle(vis, (u_s, v_s), 8, (0, 0, 0),   1)
 
@@ -670,11 +678,17 @@ class Dam4SamTracker(Node):
         K: np.ndarray,
     ) -> Optional[np.ndarray]:
         h, w = depth.shape
-        # SAM2 internally resizes to image_size×image_size before producing
-        # masks, so centroid_uv lives in that resized space.
-        u_scaled = float(uv[0]) * w / SAM2_CFG["image_size"]
-        v_scaled = float(uv[1]) * h / SAM2_CFG["image_size"]
-        u_i, v_i = int(u_scaled), int(v_scaled)
+        # `video_res_masks` is what produced this centroid; that path runs
+        # `predictor._get_orig_video_res_output(...)`, which returns the
+        # mask at the *original video resolution* — i.e. the same (w, h)
+        # as the depth image. The centroid is already in pixel coords;
+        # do NOT rescale by SAM2_CFG["image_size"]. (Earlier code did,
+        # which projected u,v ≈ 50,28 instead of 160,120 for a centered
+        # leader, hit the sky-pixel finite==0 fallback, and dropped
+        # every detection.)
+        u_pix = float(uv[0])
+        v_pix = float(uv[1])
+        u_i, v_i = int(u_pix), int(v_pix)
         if not (0 <= u_i < w and 0 <= v_i < h):
             return None
 
@@ -686,18 +700,19 @@ class Dam4SamTracker(Node):
         d = float(np.median(finite))
 
         fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
-        p_opt = np.array([
-            (u_scaled - cx) * d / fx,
-            (v_scaled - cy) * d / fy,
-            d,
-            1.0,
-        ])
-
-        T = self._lookup_T_base_optical()
-        if T is None:
-            return None
-        p_base = T @ p_opt
-        return p_base[:2]
+        # Optical frame: x right, y down, z forward (REP-103 camera).
+        opt_x = (u_pix - cx) * d / fx
+        opt_y = (v_pix - cy) * d / fy
+        opt_z = d
+        # Hardcoded optical → base_link transform — mirrors oracle_camera's
+        # body→optical math in reverse, since gz_bridge doesn't publish
+        # follower/camera_optical_frame to /tf and tf2 lookup fails. The
+        # camera is mounted (CAM_OFFSET_X_BODY, 0, CAM_OFFSET_Z_BODY)
+        # forward + up of base_link, no rotation other than the standard
+        # optical-to-body axis convention.
+        body_x = opt_z + CAM_OFFSET_X_BODY
+        body_y = -opt_x
+        return np.array([body_x, body_y])
 
     def _lookup_T_base_optical(self) -> Optional[np.ndarray]:
         if self._T_base_optical is not None:

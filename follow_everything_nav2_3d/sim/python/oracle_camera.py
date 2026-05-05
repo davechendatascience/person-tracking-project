@@ -2,19 +2,21 @@
 rendered camera as DAM4SAM, so the two are directly comparable.
 
 Pipeline:
-  1. Follower pose from /gz_pose_truth (SceneBroadcaster -> bridge).
-  2. Leader pose: replayed from /clock + the trajectory waypoints below
-     (Fortress doesn't expose <actor> entity poses on any topic; the
-     trajectory is deterministic and lives in sim/worlds/empty.world).
+  1. Follower pose from /gz_pose_truth (SceneBroadcaster -> bridge),
+     child_frame_id == "follower".
+  2. Leader pose from the same /gz_pose_truth feed,
+     child_frame_id == "leader".  The leader is a <model> driven by
+     leader_controller.py via /leader/cmd_vel; gz publishes its pose
+     authoritatively, so the oracle uses ground truth directly (no
+     analytical waypoint replay).
   3. Camera intrinsics from /follower/camera/camera_info.
-  4. Project the leader's 3D position into the camera_optical_frame using
-     the camera's actual pose on the chassis. Accept the detection iff
-     the projected pixel (u, v) is inside the image AND depth > min_clip.
+  4. Project the leader's 3D position into camera_optical_frame using the
+     camera's actual mount offset on the chassis.  Accept the detection
+     iff the projected pixel is inside the rendered image AND depth > 0.
   5. Emit body-frame (x, y) on /follower/camera/detections.
 
-This way the oracle's FOV is *exactly* what the gz camera renders, and
-DAM4SAM (which runs on the rendered RGB) and the oracle agree on what
-"in view" means.
+Same intrinsics + same frustum as DAM4SAM, so they agree on what's "in
+view".
 """
 import math
 
@@ -23,7 +25,6 @@ import rclpy
 from rclpy.node import Node
 
 from geometry_msgs.msg import Quaternion
-from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import CameraInfo
 from tf2_msgs.msg import TFMessage
 from vision_msgs.msg import (
@@ -35,33 +36,22 @@ from vision_msgs.msg import (
 
 PUBLISH_RATE_HZ = 20.0
 MAX_RANGE_M    = 6.0      # match the 2D sim's CameraDetector range gate
+CAM_FOV_DEG    = 90.0     # match the rgbd_camera sensor's horizontal_fov
 
 FOLLOWER_FRAME = "follower"
+LEADER_FRAME   = "leader"
 
 # Camera mount on the chassis — must match sim/worlds/empty.world's
 # rgbd_camera sensor pose (camera at chassis-relative (0.23, 0, 0.05);
 # chassis itself sits at world z=0.10; so camera is at world z=0.15).
-CAM_OFFSET_X_BODY = 0.23   # camera_link x in follower body frame
-CAM_OFFSET_Z_BODY = 0.15   # camera_link z in world frame (≈ body frame z)
-CAM_MIN_DEPTH_M   = 0.10   # near clip from the rgbd_camera in the SDF
+CAM_OFFSET_X_BODY = 0.23
+CAM_OFFSET_Z_BODY = 0.15
+CAM_MIN_DEPTH_M   = 0.10
 
-# Leader trajectory (mirrors empty.world::<actor name="leader">).
-# (t_seconds, x, y, z). z = mesh body-center height ≈ 0.50 m for the
-# Mingfei actor, used for the projection's vertical component.
-LEADER_Z = 0.50
-LEADER_WAYPOINTS = [
-    ( 0.0,  3.0,  0.0),
-    ( 6.0,  3.0,  4.0),
-    ( 8.0,  3.0,  4.0),
-    (17.0, -3.0,  4.0),
-    (19.0, -3.0,  4.0),
-    (28.0, -3.0, -2.0),
-    (30.0, -3.0, -2.0),
-    (39.0,  3.0, -2.0),
-    (41.0,  3.0, -2.0),
-    (44.0,  3.0,  0.0),
-]
-LEADER_LOOP_PERIOD = LEADER_WAYPOINTS[-1][0]
+# Approximate body-center height of the leader model (50 cm above ground
+# isn't right for our 1.7 m model — body center is at z≈0.85 m). Used only
+# for vertical projection.
+LEADER_Z = 0.85
 
 
 def yaw_from_quat(q: Quaternion) -> float:
@@ -70,30 +60,16 @@ def yaw_from_quat(q: Quaternion) -> float:
     return math.atan2(siny_cosp, cosy_cosp)
 
 
-def leader_xy_at(t_sec: float) -> tuple[float, float]:
-    t = t_sec % LEADER_LOOP_PERIOD
-    for i in range(len(LEADER_WAYPOINTS) - 1):
-        t0, x0, y0 = LEADER_WAYPOINTS[i]
-        t1, x1, y1 = LEADER_WAYPOINTS[i + 1]
-        if t0 <= t <= t1:
-            if t1 == t0:
-                return x0, y0
-            a = (t - t0) / (t1 - t0)
-            return x0 + a * (x1 - x0), y0 + a * (y1 - y0)
-    return LEADER_WAYPOINTS[-1][1], LEADER_WAYPOINTS[-1][2]
-
-
 class OracleCamera(Node):
     def __init__(self) -> None:
         super().__init__("oracle_camera")
         self.follower_xyy: tuple[float, float, float] | None = None
-        self.sim_time_sec: float | None = None
+        self.leader_xy:    tuple[float, float] | None        = None
         self.K: np.ndarray | None = None
         self.image_w: int = 0
         self.image_h: int = 0
 
         self.create_subscription(TFMessage, "/gz_pose_truth", self._on_poses, 50)
-        self.create_subscription(Clock, "/clock", self._on_clock, 10)
         self.create_subscription(
             CameraInfo, "/follower/camera/camera_info",
             self._on_camera_info, 10)
@@ -106,13 +82,12 @@ class OracleCamera(Node):
 
     def _on_poses(self, msg: TFMessage) -> None:
         for tr in msg.transforms:
+            t = tr.transform.translation
             if tr.child_frame_id == FOLLOWER_FRAME:
-                t = tr.transform.translation
-                self.follower_xyy = (t.x, t.y, yaw_from_quat(tr.transform.rotation))
-                return
-
-    def _on_clock(self, msg: Clock) -> None:
-        self.sim_time_sec = msg.clock.sec + msg.clock.nanosec * 1e-9
+                self.follower_xyy = (
+                    t.x, t.y, yaw_from_quat(tr.transform.rotation))
+            elif tr.child_frame_id == LEADER_FRAME:
+                self.leader_xy = (t.x, t.y)
 
     def _on_camera_info(self, msg: CameraInfo) -> None:
         self.K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
@@ -123,18 +98,17 @@ class OracleCamera(Node):
         if self.follower_xyy is None:
             self.get_logger().warn("oracle: no follower pose yet")
             return
-        if self.sim_time_sec is None:
-            self.get_logger().warn("oracle: no /clock yet")
+        if self.leader_xy is None:
+            self.get_logger().warn("oracle: no leader pose yet")
             return
         if self.K is None:
             self.get_logger().warn("oracle: no /follower/camera/camera_info yet")
             return
-        lx, ly = leader_xy_at(self.sim_time_sec)
+        lx, ly = self.leader_xy
         fx, fy, fyaw = self.follower_xyy
         d = math.hypot(lx - fx, ly - fy)
         self.get_logger().info(
-            f"oracle: t={self.sim_time_sec:.1f}s "
-            f"F=({fx:+.2f},{fy:+.2f},{math.degrees(fyaw):+.0f}°) "
+            f"oracle: F=({fx:+.2f},{fy:+.2f},{math.degrees(fyaw):+.0f}°) "
             f"L=({lx:+.2f},{ly:+.2f}) d={d:.2f}m emits={self._emit_count}/{self._tick_count}")
 
     def _tick(self) -> None:
@@ -143,45 +117,36 @@ class OracleCamera(Node):
         out.header.stamp = self.get_clock().now().to_msg()
         out.header.frame_id = "follower/base_link"
 
-        if (self.follower_xyy is None or self.sim_time_sec is None
+        if (self.follower_xyy is None
+                or self.leader_xy is None
                 or self.K is None):
             self.pub.publish(out)
             return
 
-        # 1. Leader pose (world).
-        lx, ly = leader_xy_at(self.sim_time_sec)
-        # 2. Follower pose (world).
         fx, fy, fyaw = self.follower_xyy
-        # 3. Leader in follower body frame (x-forward, y-left, z-up).
+        lx, ly       = self.leader_xy
+
         c, s = math.cos(fyaw), math.sin(fyaw)
         body_x =  c * (lx - fx) + s * (ly - fy)
         body_y = -s * (lx - fx) + c * (ly - fy)
         body_z = LEADER_Z
 
-        # 4. Range gate first (cheap), matches the 2D sim's 6 m guard.
         rng = math.hypot(body_x, body_y)
         if rng > MAX_RANGE_M:
             self.pub.publish(out)
             return
 
-        # 5. Transform body -> camera_link (translate forward + up).
-        cl_x = body_x - CAM_OFFSET_X_BODY
-        cl_y = body_y
-        cl_z = body_z - CAM_OFFSET_Z_BODY
-
-        # 6. camera_link (REP-103, x-fwd, y-left, z-up) -> camera_optical
-        #    (z-fwd, x-right, y-down):
-        opt_x = -cl_y
-        opt_y = -cl_z
-        opt_z =  cl_x
-        if opt_z <= CAM_MIN_DEPTH_M:
-            self.pub.publish(out)
-            return
-
-        # 7. Project through K. Accept iff inside image bounds.
-        u = self.K[0, 0] * opt_x / opt_z + self.K[0, 2]
-        v = self.K[1, 1] * opt_y / opt_z + self.K[1, 2]
-        if not (0.0 <= u < self.image_w and 0.0 <= v < self.image_h):
+        # Match the 2D project's CameraDetector: a flat horizontal-FOV
+        # cone + range gate, no image-plane projection. The previous
+        # u/v bounds check was rejecting valid detections at close
+        # range — the rgbd_camera is 320x240 with 90° H-FOV, which
+        # makes V-FOV only ~74°, and a 0.85 m tall leader projected
+        # *above* the top of the frame whenever distance < ~0.93 m.
+        # For an "oracle" we want the geometric truth, not a real-camera
+        # frustum — the BT then sees a leader in the same fan the
+        # snapshotter draws.
+        bearing = math.atan2(body_y, body_x)
+        if abs(bearing) > math.radians(CAM_FOV_DEG / 2):
             self.pub.publish(out)
             return
 
@@ -202,9 +167,12 @@ def main() -> None:
     node = OracleCamera()
     try:
         rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

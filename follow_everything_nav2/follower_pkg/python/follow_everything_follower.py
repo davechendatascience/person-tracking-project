@@ -1430,6 +1430,8 @@ def main():
         return
     try:
         rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     except Exception as e:
         import traceback
         print(f"[FOLLOWER] spin CRASH: {e!r}", flush=True)

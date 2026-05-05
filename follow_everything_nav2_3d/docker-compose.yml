@@ -31,6 +31,9 @@ services:
       # the `_DEPS_ROOT` constant in dam4sam_tracker.py both point here.
       - ../DAM4SAM:/opt/DAM4SAM:ro
       - ../follow_everything:/opt/follow_everything:ro
+      # 2D project: we lift its BT-based follower + sim.world / sim.geometry
+      # / sim.planner modules into our 3D port instead of rewriting.
+      - ../follow_everything_nav2:/opt/follow_everything_nav2:ro
       - ../sam2.1_hiera_large.pt:/opt/sam2.1_hiera_large.pt:ro
       - ../yolo11m.pt:/opt/yolo11m.pt:ro
     working_dir: /ws

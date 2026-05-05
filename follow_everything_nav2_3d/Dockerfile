@@ -71,13 +71,19 @@ RUN pip install --no-cache-dir \
         iopath \
         einops \
         ultralytics \
-        tqdm
+        tqdm \
+        scipy \
+        py_trees
 
 WORKDIR /ws
-# PYTHONPATH note: /opt is the parent of /opt/follow_everything (the
-# `follow_everything` package), so `from follow_everything.perception import …`
-# resolves. /opt/DAM4SAM goes on the path directly because we import its
-# `sam2` subdirectory as a top-level module (matches the pattern in
-# follow_everything/perception/sam2_tracker.py).
+# PYTHONPATH:
+#   /opt              parent of `follow_everything/` and `follow_everything_nav2/`
+#                     so `from follow_everything.perception import …` resolves.
+#   /opt/DAM4SAM      so `import sam2` (DAM4SAM's modified copy) resolves.
+#   /opt/follow_everything_nav2
+#                     so `from sim.world import ROBOT_RADIUS` resolves
+#                     (the 2D project's BT follower expects `sim` as a
+#                     top-level package — its sim/ folder lives at
+#                     /opt/follow_everything_nav2/sim/).
 ENV WS_ROOT=/ws \
-    PYTHONPATH=/ws:/opt:/opt/DAM4SAM:${PYTHONPATH}
+    PYTHONPATH=/ws:/opt:/opt/DAM4SAM:/opt/follow_everything_nav2:${PYTHONPATH}

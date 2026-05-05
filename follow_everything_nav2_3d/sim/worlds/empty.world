@@ -268,7 +268,13 @@
         <wheel_radius>0.06</wheel_radius>
         <max_wheel_torque>200</max_wheel_torque>
         <topic>/follower/cmd_vel</topic>
-        <odom_topic>/follower/odom</odom_topic>
+        <!-- gz's diff-drive odom is in the follower's local odom frame
+             (origin at spawn pose). The BT consumes /follower/odom as if
+             it were world-frame, which mis-places the A* grid by the
+             spawn offset. We redirect gz's odom to a parking topic and
+             use sim/python/world_odom_publisher.py to publish a true
+             world-frame /follower/odom from /gz_pose_truth instead. -->
+        <odom_topic>/follower/odom_local</odom_topic>
         <tf_topic>/follower/tf</tf_topic>
         <frame_id>follower/odom</frame_id>
         <child_frame_id>chassis</child_frame_id>
@@ -291,47 +297,98 @@
       </plugin>
     </model>
 
-    <!-- Walking-human leader. Skeletal mesh + walk animation from Fuel; first
-         run requires internet so the model is fetched into ~/.ignition/fuel.
-         Trajectory: a slow rectangular patrol around the origin at ~0.7 m/s
-         (slower than the follower's 1.5 m/s max so the follower can catch up).
-         The Mingfei actor's mesh origin sits roughly at body-center, so
-         trajectory z must be ~0.4959 m for the feet to land on the ground.
-         z=1.0 floats; z=0 sinks the body underground.
-    -->
-    <actor name="leader">
-      <pose>3 0 0.4959 0 0 1.5708</pose>
-      <skin>
-        <filename>https://fuel.gazebosim.org/1.0/Mingfei/models/actor/tip/files/meshes/walk.dae</filename>
-        <scale>1.0</scale>
-      </skin>
-      <animation name="walking">
-        <filename>https://fuel.gazebosim.org/1.0/Mingfei/models/actor/tip/files/meshes/walk.dae</filename>
-        <interpolate_x>true</interpolate_x>
-      </animation>
-      <script>
-        <loop>true</loop>
-        <delay_start>0.0</delay_start>
-        <auto_start>true</auto_start>
-        <trajectory id="0" type="walking">
-          <waypoint><time> 0</time><pose> 3  0 0.4959 0 0  1.5708</pose></waypoint>
-          <waypoint><time> 6</time><pose> 3  4 0.4959 0 0  1.5708</pose></waypoint>
-          <waypoint><time> 8</time><pose> 3  4 0.4959 0 0  3.1416</pose></waypoint>
-          <waypoint><time>17</time><pose>-3  4 0.4959 0 0  3.1416</pose></waypoint>
-          <waypoint><time>19</time><pose>-3  4 0.4959 0 0 -1.5708</pose></waypoint>
-          <waypoint><time>28</time><pose>-3 -2 0.4959 0 0 -1.5708</pose></waypoint>
-          <waypoint><time>30</time><pose>-3 -2 0.4959 0 0  0     </pose></waypoint>
-          <waypoint><time>39</time><pose> 3 -2 0.4959 0 0  0     </pose></waypoint>
-          <waypoint><time>41</time><pose> 3 -2 0.4959 0 0  1.5708</pose></waypoint>
-          <waypoint><time>44</time><pose> 3  0 0.4959 0 0  1.5708</pose></waypoint>
-        </trajectory>
-      </script>
-      <!-- Note: gz-sim Fortress's SceneBroadcaster does NOT publish actor
-           entity poses on any /world/<world>/*pose* topic, and the
-           pose-publisher-system can't attach to <actor>. The oracle camera
-           reconstructs the leader's pose by replaying the trajectory above
-           from /clock — see sim/python/oracle_camera.py::LEADER_WAYPOINTS.
-           If you change the trajectory, mirror the change there. -->
-    </actor>
+    <!-- ==============================================================
+         LEADER — humanoid-shaped <model> (replaces the previous <actor>).
+         Why: Fortress's actor system doesn't publish entity poses to
+         SceneBroadcaster, and gz interpolates the trajectory in a way
+         we can't reproduce analytically (verified empirically). With a
+         <model>, the pose-publisher-system gives us live ground truth
+         on /model/leader/pose, and VelocityControl makes the model
+         drivable via a Twist on /leader/cmd_vel.
+         Visual: cylinder torso + sphere head + simple legs — distinct
+         person silhouette so YOLO's "person" class still triggers.
+         Trade-off vs the actor: no walking animation; the figure
+         translates and rotates rigidly along the patrol path.
+         ============================================================== -->
+    <model name="leader">
+      <pose>3 0 0 0 0 1.5708</pose>
+
+      <link name="body">
+        <inertial>
+          <!-- Tall narrow person, mass 50 kg.
+               Use rough principal moments; VelocityControl is kinematic
+               (overrides physics integration) so exact values don't matter
+               much, but they must be valid (triangle inequality). -->
+          <mass>50.0</mass>
+          <inertia>
+            <ixx>10.0</ixx><iyy>10.0</iyy><izz>1.0</izz>
+            <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+          </inertia>
+        </inertial>
+
+        <!-- Torso. -->
+        <visual name="torso">
+          <pose>0 0 0.85 0 0 0</pose>
+          <geometry><cylinder><radius>0.18</radius><length>1.10</length></cylinder></geometry>
+          <material>
+            <ambient>0.20 0.50 0.90 1</ambient>
+            <diffuse>0.20 0.50 0.90 1</diffuse>
+          </material>
+        </visual>
+        <!-- Head. -->
+        <visual name="head">
+          <pose>0 0 1.55 0 0 0</pose>
+          <geometry><sphere><radius>0.12</radius></sphere></geometry>
+          <material>
+            <ambient>0.95 0.78 0.65 1</ambient>
+            <diffuse>0.95 0.78 0.65 1</diffuse>
+          </material>
+        </visual>
+        <!-- Legs (single capsule each, easier than 4 cylinders). -->
+        <visual name="left_leg">
+          <pose>0 0.08 0.30 0 0 0</pose>
+          <geometry><cylinder><radius>0.06</radius><length>0.55</length></cylinder></geometry>
+          <material><diffuse>0.10 0.10 0.30 1</diffuse></material>
+        </visual>
+        <visual name="right_leg">
+          <pose>0 -0.08 0.30 0 0 0</pose>
+          <geometry><cylinder><radius>0.06</radius><length>0.55</length></cylinder></geometry>
+          <material><diffuse>0.10 0.10 0.30 1</diffuse></material>
+        </visual>
+
+        <!-- Single cylindrical collision approximating the whole body
+             so the lidar / camera see a person-sized obstacle. -->
+        <collision name="body_collision">
+          <pose>0 0 0.85 0 0 0</pose>
+          <geometry><cylinder><radius>0.20</radius><length>1.70</length></cylinder></geometry>
+          <surface>
+            <friction><ode><mu>0.0</mu><mu2>0.0</mu2></ode></friction>
+          </surface>
+        </collision>
+      </link>
+
+      <!-- VelocityControl applies a body-frame Twist (linear x = forward,
+           angular z = yaw rate) to the model each step, kinematically.
+           No wheels needed; the model just glides. The Python controller
+           in sim/python/leader_controller.py drives this topic. -->
+      <plugin filename="ignition-gazebo-velocity-control-system"
+              name="ignition::gazebo::systems::VelocityControl">
+        <topic>/leader/cmd_vel</topic>
+      </plugin>
+
+      <!-- Now SceneBroadcaster will publish this model's pose on
+           /world/empty/dynamic_pose/info as it moves. -->
+      <plugin filename="ignition-gazebo-pose-publisher-system"
+              name="ignition::gazebo::systems::PosePublisher">
+        <publish_link_pose>false</publish_link_pose>
+        <publish_visual_pose>false</publish_visual_pose>
+        <publish_collision_pose>false</publish_collision_pose>
+        <publish_sensor_pose>false</publish_sensor_pose>
+        <publish_model_pose>true</publish_model_pose>
+        <publish_nested_model_pose>false</publish_nested_model_pose>
+        <use_pose_vector_msg>true</use_pose_vector_msg>
+        <update_frequency>30</update_frequency>
+      </plugin>
+    </model>
   </world>
 </sdf>

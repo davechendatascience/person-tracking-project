@@ -420,7 +420,12 @@ class Dam4SamTracker(Node):
                     box=self._init_bbox.astype(np.float32),
                 )
                 mask0 = (init_masks[0, 0] > 0.0).cpu().numpy()
+                log.info(
+                    f"sam2 frame 0 init mask: shape={mask0.shape} "
+                    f"px_on={int(mask0.sum())} bbox={self._init_bbox.tolist()}")
                 _push_result(0, _make_result(mask0))
+                vis_n = 1 if mask0.any() else 0
+                inv_n = 0 if mask0.any() else 1
 
                 # Mandatory before any _run_single_frame_inference call —
                 # consolidates conditioning frames into the right buffers.
@@ -463,6 +468,9 @@ class Dam4SamTracker(Node):
                     mask = (video_res_masks[0, 0] > 0.0).cpu().numpy()
                     if mask.any():
                         last_good_mask = mask
+                        vis_n += 1
+                    else:
+                        inv_n += 1
                     _push_result(frame_idx, _make_result(mask))
 
                     # 5. Memory hygiene.
@@ -489,7 +497,9 @@ class Dam4SamTracker(Node):
                             f"sam2 online f={frame_idx} "
                             f"non_cond={len(ncfo)} cond={len(cfo)} "
                             f"cuda alloc={torch.cuda.memory_allocated()/1e9:.2f}GB "
-                            f"reserved={torch.cuda.memory_reserved()/1e9:.2f}GB")
+                            f"reserved={torch.cuda.memory_reserved()/1e9:.2f}GB "
+                            f"vis={vis_n}/{vis_n+inv_n} "
+                            f"last_mask_px={int(mask.sum())}")
 
                     # 6. Periodic session restart — the only reliable way to
                     #    keep VRAM bounded across long runs. Note: we MUST
@@ -556,6 +566,8 @@ class Dam4SamTracker(Node):
                                 #    fresh at SAM2 frame 1.
                                 frame_idx = 0
                                 session_start = 0
+                                vis_n = 0
+                                inv_n = 0
 
                     frame_idx += 1
         except Exception as e:
@@ -719,9 +731,12 @@ def main() -> None:
     node = Dam4SamTracker()
     try:
         rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

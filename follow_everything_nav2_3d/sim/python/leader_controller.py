@@ -136,23 +136,36 @@ class LeaderController(Node):
 
     # ------------------------------------------------------------------
     def _pick_random_goal(self) -> tuple[float, float] | None:
-        """Sample a random goal in a SAMPLE_RADIUS_M box around the spawn.
+        """Sample a random goal in a SAMPLE_RADIUS_M box around the spawn,
+        clipped to the map interior, with progressive constraint relaxation.
 
-        Rejects samples that would force the leader to turn sharply or to
-        walk a tiny distance — both produce direction changes faster than
-        the follower's 90° FOV can track. Empty-world rejections are rare
-        because the box is large; with obstacles the budget is bounded."""
+        Three passes:
+          1. strict — require min distance + max turn angle + obstacle clear.
+          2. drop the turn constraint (sharper turns OK if needed).
+          3. drop the distance constraint (any free spot will do).
+
+        All three clip the sample to the (margin, Wm-margin) interior so we
+        never hand astar a goal outside its grid (which would silently fail
+        and freeze the leader)."""
         if self.patrol_origin is None or self.cur_xyy is None:
             return None
         ox, oy = self.patrol_origin
         cx, cy, cyaw = self.cur_xyy
         max_turn_rad = math.radians(MAX_TURN_DEG)
-        for _ in range(100):
+        Wm, Hm = self.world_size
+        margin = LEADER_RADIUS + 0.1
+
+        def _sample_one():
             gx = ox + self.rng.uniform(-SAMPLE_RADIUS_M, SAMPLE_RADIUS_M)
             gy = oy + self.rng.uniform(-SAMPLE_RADIUS_M, SAMPLE_RADIUS_M)
+            gx = max(margin, min(Wm - margin, gx))
+            gy = max(margin, min(Hm - margin, gy))
+            return gx, gy
+
+        for _ in range(100):
+            gx, gy = _sample_one()
             dx, dy = gx - cx, gy - cy
-            dist = math.hypot(dx, dy)
-            if dist < MIN_GOAL_DIST_M:
+            if math.hypot(dx, dy) < MIN_GOAL_DIST_M:
                 continue
             target_yaw = math.atan2(dy, dx)
             yaw_err = abs(
@@ -163,10 +176,16 @@ class LeaderController(Node):
                     gx, gy, LEADER_RADIUS, self.obstacles):
                 continue
             return (gx, gy)
-        # Fall back to relaxed sampling — better a sharp goal than no goal.
         for _ in range(50):
-            gx = ox + self.rng.uniform(-SAMPLE_RADIUS_M, SAMPLE_RADIUS_M)
-            gy = oy + self.rng.uniform(-SAMPLE_RADIUS_M, SAMPLE_RADIUS_M)
+            gx, gy = _sample_one()
+            if math.hypot(gx - cx, gy - cy) < MIN_GOAL_DIST_M:
+                continue
+            if self.use_planner and circle_collides_aabbs(
+                    gx, gy, LEADER_RADIUS, self.obstacles):
+                continue
+            return (gx, gy)
+        for _ in range(50):
+            gx, gy = _sample_one()
             if self.use_planner and circle_collides_aabbs(
                     gx, gy, LEADER_RADIUS, self.obstacles):
                 continue

@@ -1,30 +1,27 @@
-"""DAM4SAM tracker bridge — Phase 4b-ii.
+"""DAM4SAM tracker bridge.
 
-Online streaming SAM2/DAM4SAM tracker.
+Online streaming wrapper around the *full* DAM4SAM tracker (with DRM —
+Distractor Rejection Module — and proper temporal smoothing). The earlier
+version of this file ran a bespoke per-frame `_run_single_frame_inference`
+loop with no DRM; on a low-poly Gazebo actor the mask collapsed within
+~30 frames and never recovered. Replaced with `DAM4SAMTracker` from
+/opt/DAM4SAM, which manages its own inference state, DRM bookkeeping,
+and mask propagation.
 
-The tracker is **slow** (sam2.1_hiera_large is ~5–8 Hz on a GB10), the camera
-is **fast** (20 Hz). Coupling them naïvely backs up frames. So:
+The tracker is slow (sam2.1_hiera_large ≈ 5–8 Hz on a GB10), the camera
+is fast (20 Hz). Coupling them naïvely backs up frames, so:
 
     - Lidar + oracle keep ticking at 20 Hz, untouched.
-    - The DAM4SAM topic /follower/camera/detections_dam4sam ticks at whatever
-      SAM2 actually sustains — we publish exactly when SAM2 yields a result.
-    - SAM2 still sees a *contiguous* index sequence (0, 1, 2, …) because
-      `propagate_in_video` requires temporal continuity, but each slot is
-      filled with whatever the latest camera frame is at the moment SAM2
-      asks for it. Frames that arrive while SAM2 is busy on the previous
-      one are dropped.
+    - The detection topic /follower/camera/detections_dam4sam ticks at
+      DAM4SAM's actual rate — we publish exactly when DAM4SAM yields a
+      result.
+    - On every track() call we snapshot the *latest* camera RGB at that
+      moment. Frames that arrived while the tracker was busy are simply
+      dropped. The tracker itself sees a contiguous frame index sequence.
 
-Implementation: a `LiveLoader` subclass of follow_everything's
-`StreamingFrameLoader` that, on `__getitem__(idx)`, *first* asks the node to
-write the current latest RGB to that path, *then* defers to the parent
-loader's normal load.
-
-Frame 0 is special: we use the snapshot of (rgb, depth, K) captured at the
-moment YOLO produced the init bbox, so the bbox aligns with what SAM2 sees.
-
-Bootstrap: YOLO11 finds the highest-confidence "person" box on the first
-incoming RGB frame; that box becomes the SAM2 init prompt. Until then the
-node publishes empty Detection2DArrays.
+Bootstrap: YOLO11 finds the highest-confidence 'person' box on the first
+incoming RGB frame; that box becomes the DAM4SAM init prompt. Until then
+the node publishes empty Detection2DArrays.
 """
 import os
 # Must be set before torch is imported anywhere. Tells the CUDA caching
@@ -36,18 +33,17 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import sys
 import threading
 import queue
-import tempfile
+import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
+import cv2  # used in _publish_overlay
 import numpy as np
-import cv2
 import rclpy
 from rclpy.node import Node
 
-import tf2_ros
-from geometry_msgs.msg import TransformStamped
 from sensor_msgs.msg import CameraInfo, Image
 from vision_msgs.msg import (
     Detection2D,
@@ -68,23 +64,17 @@ for _p in ("/ws", "/opt", "/opt/DAM4SAM"):
 
 # ---------------------------------------------------------------------------
 SAM2_CFG = {
-    "model_cfg":  "configs/sam2.1/sam2.1_hiera_l.yaml",  # aliased to sam21pp
+    # The DAM4SAM repo ships its own sam21pp_*.yaml configs alongside
+    # /opt/DAM4SAM/sam2/. We load the SAM2 1.0 plus-plus large variant.
+    "model_cfg":  "sam21pp_hiera_l.yaml",
     "checkpoint": "/opt/sam2.1_hiera_large.pt",
     "device":     "cuda",
-    # Pinned at 1024 — the hiera_l checkpoint was trained at this resolution
-    # and the predictor asserts on shape. Memory pressure is mitigated below
-    # by offload=True on the loader (image cache lives on CPU, not GPU).
     "image_size": 1024,
 }
-# Mirrors configs/follow_everything.yaml::perception so SAM2Tracker's DRM
-# bookkeeping has every key it reads.
+# Heuristic gates for our TrackResult — DAM4SAM gives us the mask, we
+# decide whether the mask is "real enough" to publish a body-frame xy.
 PERCEPTION_CFG = {
-    "temporal_buffer_size": 10,
-    "num_distance_bins":    5,
-    "distance_bin_width":   1.0,
-    "min_mask_confidence":  0.40,
     "min_mask_area_ratio":  0.0005,
-    "fov_half_angle_deg":   90.0,
 }
 
 YOLO_WEIGHTS = "/opt/yolo11m.pt"
@@ -99,10 +89,19 @@ PERSON_CLS   = 0  # COCO
 CAM_OFFSET_X_BODY = 0.23
 CAM_OFFSET_Z_BODY = 0.15
 
-# Pre-allocated paths for the loader; SAM2 stops when this many frames have
-# been processed. At ~5 Hz that's ~5.5 hours; plenty for a Phase 4 demo.
+# Hard cap on total frames the worker will process before exiting. At
+# ~5 Hz that's ~5.5 hours; plenty for a long demo.
 MAX_FRAMES = 100_000
 SIDE_DATA_KEEP = 64  # only need the most recent few for projection lookup
+
+
+# Result emitted by the worker thread for each tracker step.
+@dataclass
+class TrackResult:
+    mask: Optional[np.ndarray]
+    confidence: float
+    centroid_uv: Optional[Tuple[float, float]]
+    is_visible: bool
 
 
 # ---------------------------------------------------------------------------
@@ -117,22 +116,10 @@ def _msg_to_depth(msg: Image) -> np.ndarray:
     return np.frombuffer(msg.data, dtype=np.float32).reshape(msg.height, msg.width)
 
 
-def _quat_to_R(q) -> np.ndarray:
-    x, y, z, w = q.x, q.y, q.z, q.w
-    return np.array([
-        [1 - 2*(y*y + z*z), 2*(x*y - z*w),     2*(x*z + y*w)],
-        [2*(x*y + z*w),     1 - 2*(x*x + z*z), 2*(y*z - x*w)],
-        [2*(x*z - y*w),     2*(y*z + x*w),     1 - 2*(x*x + y*y)],
-    ])
-
-
 # ---------------------------------------------------------------------------
 class Dam4SamTracker(Node):
     def __init__(self) -> None:
         super().__init__("dam4sam_tracker")
-
-        self._tmpdir = Path(tempfile.mkdtemp(prefix="dam4sam_stream_"))
-        self._frame_paths = [self._tmpdir / f"{i:08d}.jpg" for i in range(MAX_FRAMES)]
 
         # ---- Atomic snapshot of the latest ROS frame --------------------
         self._snap_lock = threading.Lock()
@@ -140,6 +127,7 @@ class Dam4SamTracker(Node):
         self._latest_depth: Optional[np.ndarray] = None
         self._latest_K: Optional[np.ndarray] = None
         self._latest_stamp = None
+        self._latest_stamp_seen_by_worker = None
         self._got_first_rgb = threading.Event()
 
         # Captured at YOLO bootstrap so SAM2 frame 0 == YOLO frame.
@@ -173,19 +161,16 @@ class Dam4SamTracker(Node):
         self.overlay_pub = self.create_publisher(
             Image, "/follower/camera/dam4sam_overlay", 10)
 
-        self._tf_buf = tf2_ros.Buffer()
-        self._tf_listener = tf2_ros.TransformListener(self._tf_buf, self)
-        self._T_base_optical: Optional[np.ndarray] = None
-
         # 50 Hz drain — non-blocking. Whenever SAM2 has yielded, we publish.
         self.create_timer(0.02, self._publish_results)
         self._worker = threading.Thread(target=self._tracker_worker, daemon=True)
         self._worker.start()
 
         self.get_logger().info(
-            f"DAM4SAM tracker live. stream dir: {self._tmpdir}. "
+            f"DAM4SAM tracker live. "
             f"awaiting first 'person' YOLO detection (conf ≥ {YOLO_CONF}); "
-            f"detection topic ticks at SAM2's own rate (slower than the camera).")
+            f"detection topic ticks at the tracker's own rate "
+            f"(slower than the camera).")
 
     # ------------------------------------------------------------------
     # ROS callbacks (main thread)
@@ -245,343 +230,229 @@ class Dam4SamTracker(Node):
             f"YOLO bootstrap: init bbox {bbox.tolist()} (conf {conf[i]:.2f})")
 
     # ------------------------------------------------------------------
-    # Always-latest loader hook
-    # ------------------------------------------------------------------
-    def _request_frame(self, idx: int) -> None:
-        """Called by LiveLoader.__getitem__ before it loads img_paths[idx].
-
-        For SAM2 frame 0 we hand it the YOLO-bootstrap snapshot so the bbox
-        aligns. For later frames we snapshot whatever's freshest right now —
-        this is what makes the tracker drop stale frames automatically.
-        """
-        path = self._frame_paths[idx]
-        if path.exists():
-            return  # already produced (e.g. retry / re-prompt path)
-
-        if idx == 0:
-            rgb, depth, K, stamp = (
-                self._init_rgb, self._init_depth, self._init_K, self._init_stamp)
-        else:
-            with self._snap_lock:
-                rgb = None if self._latest_rgb is None else self._latest_rgb
-                depth = None if self._latest_depth is None else self._latest_depth
-                K = None if self._latest_K is None else self._latest_K
-                stamp = self._latest_stamp
-            # Block briefly until the camera produces a new frame. We expect
-            # this to be near-instant in steady state since cam is 20Hz and
-            # SAM2 is slower.
-            wait_start = time.time()
-            while rgb is None or depth is None or K is None:
-                if self._stop.is_set() or time.time() - wait_start > 5.0:
-                    return
-                time.sleep(0.005)
-                with self._snap_lock:
-                    rgb = self._latest_rgb
-                    depth = self._latest_depth
-                    K = self._latest_K
-                    stamp = self._latest_stamp
-
-        # Encode in memory + atomic rename. We can't use cv2.imwrite directly
-        # to a `.part` tmp file — cv2 selects the encoder by file extension
-        # and `.part` has no registered writer.
-        ok, buf = cv2.imencode(".jpg", rgb[:, :, ::-1])
-        if not ok:
-            return
-        tmp = path.with_name(path.stem + ".part")
-        tmp.write_bytes(buf.tobytes())
-        os.replace(tmp, path)
-
-        with self._side_lock:
-            self._side_data[idx] = (rgb, depth, K, stamp)
-            while len(self._side_data) > SIDE_DATA_KEEP:
-                self._side_data.popitem(last=False)
-
-    # ------------------------------------------------------------------
-    # Worker thread — true online: one SAM2 step per ROS frame
+    # Worker thread — full DAM4SAM tracker, one track() per ROS frame.
     # ------------------------------------------------------------------
     def _tracker_worker(self) -> None:
+        # Wait for YOLO bootstrap.
         while not self._stop.is_set():
             if self._init_event.wait(timeout=0.5):
                 break
         if self._stop.is_set():
             return
 
-        # No propagate_in_video — that builds a fixed processing_order =
-        # range(start, num_frames) up front, which is offline-flavored.
-        # We call _run_single_frame_inference per ROS frame in our own loop:
-        # explicitly pull the freshest RGB, run one SAM2 step, emit result,
-        # advance our frame index. State accumulates exactly the same
-        # cond + non_cond entries propagate_in_video would have produced,
-        # but timing is driven by ROS, not by SAM2 walking a fixed range.
-        from follow_everything.perception.sam2_tracker import (
-            SAM2Tracker, StreamingFrameLoader, TrackResult,
-        )
-
-        import torch
-        device = SAM2_CFG["device"] if torch.cuda.is_available() else "cpu"
-        self.get_logger().info(
-            f"SAM2 (online per-frame, no DRM) device={device}, "
-            f"building predictor (slow first time)...")
-
-        helper = SAM2Tracker(PERCEPTION_CFG, SAM2_CFG)
-        helper._ensure_predictor()
-        predictor = helper._predictor
-
-        # Seed frame 0 BEFORE building inference state — _build_inference_state
-        # warms up by loading frame 0 to discover video resolution.
-        self._request_frame(0)
-
-        loader = StreamingFrameLoader(
-            img_paths=[str(p) for p in self._frame_paths],
-            image_size=SAM2_CFG["image_size"],
-            device=device,
-            offload=True,  # image cache lives on CPU, not GPU
-        )
-        state = helper._build_inference_state(loader)
-
-        NON_COND_KEEP     = 16
-        EMPTY_CACHE_EVERY = 30
-        # How far behind the active frame we keep the loader's CPU image cache
-        # and the on-disk JPEG. Anything older gets evicted / unlinked.
-        FILE_KEEP_BEHIND  = NON_COND_KEEP + 8
-        # Periodically tear down + rebuild the SAM2 session, reseeding from
-        # the latest mask. SAM2's track_step holds tensor refs in places we
-        # can't reach via dict pruning alone — only a fresh state actually
-        # releases everything. 300 frames ≈ 1 minute at 5 Hz.
-        SESSION_FRAMES    = 300
         log = self.get_logger()
-
-        def _prune(state, frame_idx):
-            cutoff = frame_idx - NON_COND_KEEP
-            if cutoff <= 0:
-                return
-            ncfo = state["output_dict"]["non_cond_frame_outputs"]
-            stale = [k for k in ncfo if k < cutoff]
-            for k in stale:
-                del ncfo[k]
-            state["consolidated_frame_inds"]["non_cond_frame_outputs"].difference_update(stale)
-            for obj_out in state["output_dict_per_obj"].values():
-                for k in [k for k in obj_out["non_cond_frame_outputs"] if k < cutoff]:
-                    del obj_out["non_cond_frame_outputs"][k]
-            for tmp in state.get("temp_output_dict_per_obj", {}).values():
-                for sect in ("cond_frame_outputs", "non_cond_frame_outputs"):
-                    d = tmp.get(sect, {})
-                    for k in [k for k in d if k < cutoff and k != 0]:
-                        del d[k]
-            # cached_features is keyed by frame_idx (int), not "image" — drop
-            # entries older than cutoff so the per-frame backbone outputs
-            # release. (Previous version had a typo'd key that pruned nothing.)
-            for k in [k for k in state["cached_features"] if k < cutoff]:
-                del state["cached_features"][k]
-            for k in [k for k in state.get("frames_already_tracked", {}) if k < cutoff]:
-                del state["frames_already_tracked"][k]
-            for ft in state.get("frames_tracked_per_obj", {}).values():
-                if isinstance(ft, dict):
-                    for k in [k for k in ft if k < cutoff]:
-                        del ft[k]
-
-        def _mask_to_bbox(mask_np: np.ndarray, pad: int = 4) -> Optional[np.ndarray]:
-            coords = np.argwhere(mask_np)
-            if len(coords) < 20:
-                return None
-            y0, x0 = coords.min(axis=0)
-            y1, x1 = coords.max(axis=0)
-            h, w = mask_np.shape
-            x0 = max(0, int(x0) - pad)
-            y0 = max(0, int(y0) - pad)
-            x1 = min(w - 1, int(x1) + pad)
-            y1 = min(h - 1, int(y1) + pad)
-            return np.array([x0, y0, x1 + 1, y1 + 1], dtype=np.float32)
-
-        def _make_result(mask_np: np.ndarray) -> "TrackResult":
-            coords = np.argwhere(mask_np)
-            h, w = mask_np.shape
-            min_area = max(20, int(h * w * PERCEPTION_CFG["min_mask_area_ratio"]))
-            if len(coords) < min_area:
-                return TrackResult(
-                    mask=None, confidence=0.0, centroid_uv=None, is_visible=False)
-            v = float(coords[:, 0].mean())
-            u = float(coords[:, 1].mean())
-            area_ratio = len(coords) / float(h * w)
-            conf = float(min(1.0, area_ratio * 50.0))
-            return TrackResult(
-                mask=mask_np, confidence=conf, centroid_uv=(u, v), is_visible=True)
-
-        def _push_result(frame_idx: int, result: "TrackResult") -> None:
-            while True:
-                try:
-                    self._results_q.put((frame_idx, result), block=False)
-                    break
-                except queue.Full:
-                    try:
-                        self._results_q.get_nowait()
-                    except queue.Empty:
-                        pass
-
         try:
-            with torch.inference_mode(), \
-                 torch.autocast(device, dtype=torch.bfloat16):
-
-                # Frame 0: prompt with the YOLO bbox.
-                _, _, init_masks = predictor.add_new_points_or_box(
-                    state, frame_idx=0, obj_id=1,
-                    box=self._init_bbox.astype(np.float32),
-                )
-                mask0 = (init_masks[0, 0] > 0.0).cpu().numpy()
-                log.info(
-                    f"sam2 frame 0 init mask: shape={mask0.shape} "
-                    f"px_on={int(mask0.sum())} bbox={self._init_bbox.tolist()}")
-                _push_result(0, _make_result(mask0))
-                vis_n = 1 if mask0.any() else 0
-                inv_n = 0 if mask0.any() else 1
-
-                # Mandatory before any _run_single_frame_inference call —
-                # consolidates conditioning frames into the right buffers.
-                predictor.propagate_in_video_preflight(state)
-                batch_size = predictor._get_obj_num(state)
-
-                # True online loop: one ROS frame in, one SAM2 step, repeat.
-                frame_idx = 1
-                session_start = 0
-                last_good_mask: Optional[np.ndarray] = mask0 if mask0.any() else None
-                import gc
-                while not self._stop.is_set() and frame_idx < MAX_FRAMES:
-                    # 1. Pull the freshest RGB and write it at this index.
-                    #    _request_frame blocks briefly until ROS produces
-                    #    a new frame after the previous SAM2 step.
-                    self._request_frame(frame_idx)
-
-                    # 2. Run SAM2 on it.
-                    current_out, pred_masks = predictor._run_single_frame_inference(
-                        inference_state=state,
-                        output_dict=state["output_dict"],
-                        frame_idx=frame_idx,
-                        batch_size=batch_size,
-                        is_init_cond_frame=False,
-                        point_inputs=None,
-                        mask_inputs=None,
-                        reverse=False,
-                        run_mem_encoder=True,
-                    )
-                    # 3. Update state the way propagate_in_video would have.
-                    state["output_dict"]["non_cond_frame_outputs"][frame_idx] = current_out
-                    state["curr_out"] = current_out
-                    predictor._add_output_per_object(
-                        state, frame_idx, current_out, "non_cond_frame_outputs")
-                    state["frames_already_tracked"][frame_idx] = {"reverse": False}
-
-                    # 4. Mask in the original video resolution.
-                    _, video_res_masks = predictor._get_orig_video_res_output(
-                        state, pred_masks)
-                    mask = (video_res_masks[0, 0] > 0.0).cpu().numpy()
-                    if mask.any():
-                        last_good_mask = mask
-                        vis_n += 1
-                    else:
-                        inv_n += 1
-                    _push_result(frame_idx, _make_result(mask))
-
-                    # 5. Memory hygiene.
-                    _prune(state, frame_idx)
-                    # 5a. Evict StreamingFrameLoader's CPU image cache (it
-                    #     keeps every loaded frame forever otherwise).
-                    evict_idx = frame_idx - FILE_KEEP_BEHIND
-                    if 0 < evict_idx < len(loader.images):
-                        loader.images[evict_idx] = None
-                    # 5b. Unlink the JPEG. Otherwise /tmp (tmpfs on most
-                    #     Linux distros) accumulates every processed frame.
-                    if 0 < evict_idx:
-                        old_path = self._frame_paths[evict_idx]
-                        if old_path.exists():
-                            try:
-                                old_path.unlink()
-                            except OSError:
-                                pass
-                    if frame_idx % EMPTY_CACHE_EVERY == 0:
-                        torch.cuda.empty_cache()
-                        ncfo = state["output_dict"]["non_cond_frame_outputs"]
-                        cfo  = state["output_dict"]["cond_frame_outputs"]
-                        log.info(
-                            f"sam2 online f={frame_idx} "
-                            f"non_cond={len(ncfo)} cond={len(cfo)} "
-                            f"cuda alloc={torch.cuda.memory_allocated()/1e9:.2f}GB "
-                            f"reserved={torch.cuda.memory_reserved()/1e9:.2f}GB "
-                            f"vis={vis_n}/{vis_n+inv_n} "
-                            f"last_mask_px={int(mask.sum())}")
-
-                    # 6. Periodic session restart — the only reliable way to
-                    #    keep VRAM bounded across long runs. Note: we MUST
-                    #    re-prompt at frame 0 (not the current frame_idx),
-                    #    because DAM4SAM's select_closest_cond_frames has a
-                    #    hardcoded `cond_frame_outputs[0]` lookup. So we
-                    #    reset SAM2's frame counter to 0 on each restart.
-                    if frame_idx - session_start >= SESSION_FRAMES:
-                        new_bbox = (_mask_to_bbox(last_good_mask)
-                                    if last_good_mask is not None else None)
-                        if new_bbox is None:
-                            log.warn(
-                                f"sam2 restart skipped at f={frame_idx}: "
-                                "no recent mask to derive bbox from")
-                            session_start = frame_idx
-                        else:
-                            # Snapshot the RGB SAM2 just processed so we can
-                            # reseed the new session at frame 0 with it.
-                            with self._side_lock:
-                                cur = self._side_data.get(frame_idx)
-                            if cur is None:
-                                log.warn(
-                                    f"sam2 restart skipped at f={frame_idx}: "
-                                    "missing side_data for current frame")
-                                session_start = frame_idx
-                            else:
-                                cur_rgb, cur_depth, cur_K, cur_stamp = cur
-                                log.info(
-                                    f"sam2 session restart f={frame_idx}->0 "
-                                    f"new_bbox={new_bbox.tolist()}")
-
-                                # 1) drop everything holding tensors
-                                del state, current_out, pred_masks, video_res_masks
-                                gc.collect()
-                                torch.cuda.empty_cache()
-
-                                # 2) overwrite frame_paths[0] with current RGB
-                                ok, buf = cv2.imencode(".jpg", cur_rgb[:, :, ::-1])
-                                if ok:
-                                    p0 = self._frame_paths[0]
-                                    tmp = p0.with_name(p0.stem + ".part")
-                                    tmp.write_bytes(buf.tobytes())
-                                    os.replace(tmp, p0)
-
-                                # 3) invalidate loader cache so it re-reads
-                                for i in range(len(loader.images)):
-                                    loader.images[i] = None
-                                loader.video_height = None
-                                loader.video_width  = None
-
-                                # 4) reset side_data; new SAM2 frame 0 = current
-                                with self._side_lock:
-                                    self._side_data.clear()
-                                    self._side_data[0] = (
-                                        cur_rgb, cur_depth, cur_K, cur_stamp)
-
-                                # 5) fresh state + prompt at frame 0
-                                state = helper._build_inference_state(loader)
-                                _, _, _ = predictor.add_new_points_or_box(
-                                    state, frame_idx=0, obj_id=1, box=new_bbox)
-                                predictor.propagate_in_video_preflight(state)
-
-                                # 6) reset our counter — next iteration starts
-                                #    fresh at SAM2 frame 1.
-                                frame_idx = 0
-                                session_start = 0
-                                vis_n = 0
-                                inv_n = 0
-
-                    frame_idx += 1
+            tracker = self._build_dam4sam_tracker(log)
         except Exception as e:
             import traceback
-            self.get_logger().error(
-                f"tracker_worker crashed: {e!r}\n{traceback.format_exc()}")
+            log.error(f"DAM4SAM build failed: {e!r}\n{traceback.format_exc()}")
+            return
+
+        from PIL import Image as PILImage
+        import torch
+
+        # ---- Frame 0: bootstrap with the YOLO snapshot --------------
+        with self._side_lock:
+            self._side_data[0] = (
+                self._init_rgb, self._init_depth,
+                self._init_K, self._init_stamp)
+
+        init_pil = PILImage.fromarray(self._init_rgb)
+        try:
+            out_dict = tracker.initialize(
+                init_pil, init_mask=None,
+                bbox=self._init_bbox.astype(np.float32).tolist())
+        except Exception as e:
+            import traceback
+            log.error(f"DAM4SAM initialize crashed: {e!r}\n{traceback.format_exc()}")
+            return
+        mask0 = out_dict["pred_mask"]
+        log.info(
+            f"DAM4SAM init: mask shape={mask0.shape} px_on={int(mask0.sum())} "
+            f"bbox={self._init_bbox.tolist()}")
+        self._push_result(0, self._make_result(mask0))
+        vis_n = 1 if mask0.any() else 0
+        inv_n = 0 if mask0.any() else 1
+
+        # ---- Streaming loop: one track() per fresh ROS frame --------
+        LOG_EVERY = 30
+        # DAM4SAMTracker stores every prepared image + per-frame predictor
+        # features in inference_state[...]. With sam2.1_hiera_l at 1024x1024
+        # that's ~3.5 GB / 30 frames if nothing is freed — we OOM in ~90 s.
+        # Keep a rolling window of recent frames; drop the rest.
+        STATE_KEEP_BEHIND = 16
+        EMPTY_CACHE_EVERY = 30
+        # The conditioning frame (frame 0) MUST stay — DAM4SAM's DRM looks
+        # it up directly. Everything else past STATE_KEEP_BEHIND can go.
+        frame_idx = 1
+        try:
+            while not self._stop.is_set() and frame_idx < MAX_FRAMES:
+                rgb, depth, K, stamp = self._snapshot_latest_blocking()
+                if rgb is None:
+                    return  # stop event or timeout
+
+                with self._side_lock:
+                    self._side_data[frame_idx] = (rgb, depth, K, stamp)
+                    while len(self._side_data) > SIDE_DATA_KEEP:
+                        self._side_data.popitem(last=False)
+
+                pil = PILImage.fromarray(rgb)
+                out_dict = tracker.track(pil, init=False)
+                mask = out_dict["pred_mask"]
+                if mask.any():
+                    vis_n += 1
+                else:
+                    inv_n += 1
+                self._push_result(frame_idx, self._make_result(mask))
+
+                self._evict_dam4sam_state(
+                    tracker, frame_idx, STATE_KEEP_BEHIND)
+
+                if frame_idx % EMPTY_CACHE_EVERY == 0:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                if frame_idx % LOG_EVERY == 0:
+                    alloc_gb = (
+                        torch.cuda.memory_allocated() / 1e9
+                        if torch.cuda.is_available() else 0.0)
+                    log.info(
+                        f"dam4sam f={frame_idx} "
+                        f"vis={vis_n}/{vis_n+inv_n} "
+                        f"last_mask_px={int(mask.sum())} "
+                        f"cuda alloc={alloc_gb:.2f}GB")
+
+                frame_idx += 1
+        except Exception as e:
+            import traceback
+            log.error(f"tracker_worker crashed: {e!r}\n{traceback.format_exc()}")
+
+    def _evict_dam4sam_state(
+        self, tracker, frame_idx: int, keep_behind: int,
+    ) -> None:
+        """Drop per-frame state in DAM4SAM's inference_state + predictor
+        caches for any frame older than (frame_idx - keep_behind), except
+        frame 0 (the DRM-anchored conditioning frame).
+
+        Called after every track() step to keep VRAM bounded."""
+        cutoff = frame_idx - keep_behind
+        if cutoff <= 0:
+            return
+        state = getattr(tracker, "inference_state", None)
+        if state is None:
+            return
+        # Prepared images live in state["images"][i].
+        imgs = state.get("images")
+        if isinstance(imgs, dict):
+            for k in [k for k in imgs if 0 < k < cutoff]:
+                del imgs[k]
+        # SAM2 video predictor caches features per frame.
+        for key in ("cached_features",):
+            d = state.get(key)
+            if isinstance(d, dict):
+                for k in [k for k in d if 0 < k < cutoff]:
+                    del d[k]
+        # Output dicts — keep frame 0 (cond) and recent non-cond.
+        out_dict = state.get("output_dict") or {}
+        for sect in ("non_cond_frame_outputs",):
+            d = out_dict.get(sect, {})
+            for k in [k for k in d if 0 < k < cutoff]:
+                del d[k]
+        # Per-object output dict mirrors the global one.
+        for obj_out in (state.get("output_dict_per_obj") or {}).values():
+            d = obj_out.get("non_cond_frame_outputs", {})
+            for k in [k for k in d if 0 < k < cutoff]:
+                del d[k]
+        # frames_already_tracked is a dict of (frame_idx -> dict).
+        ft = state.get("frames_already_tracked")
+        if isinstance(ft, dict):
+            for k in [k for k in ft if 0 < k < cutoff]:
+                del ft[k]
+
+    # ------------------------------------------------------------------
+    # DAM4SAM helpers — kept as instance methods so they're easy to test.
+    # ------------------------------------------------------------------
+    def _build_dam4sam_tracker(self, log):
+        """Instantiate the official DAM4SAMTracker, bypassing the parent's
+        `determine_tracker` lookup (which assumes the checkpoint lives at
+        /opt/DAM4SAM/checkpoints/sam2.1_hiera_large.pt — but our copy is
+        at /opt/sam2.1_hiera_large.pt and /opt/DAM4SAM is read-only)."""
+        import torch
+        sys.path.insert(0, "/opt/DAM4SAM")
+        from dam4sam_tracker import DAM4SAMTracker
+        from sam2.build_sam import build_sam2_video_predictor
+
+        device = SAM2_CFG["device"] if torch.cuda.is_available() else "cpu"
+        log.info(
+            f"DAM4SAM (full tracker, with DRM) device={device}, "
+            f"building predictor (slow first time)...")
+
+        class _LocalDAM4SAMTracker(DAM4SAMTracker):
+            def __init__(self):
+                self.checkpoint = SAM2_CFG["checkpoint"]
+                self.model_cfg = SAM2_CFG["model_cfg"]
+                self.input_image_size = SAM2_CFG["image_size"]
+                self.img_mean = torch.tensor(
+                    [0.485, 0.456, 0.406], dtype=torch.float32)[:, None, None]
+                self.img_std = torch.tensor(
+                    [0.229, 0.224, 0.225], dtype=torch.float32)[:, None, None]
+                self.predictor = build_sam2_video_predictor(
+                    self.model_cfg, self.checkpoint, device=device)
+                self.tracking_times = []
+
+        return _LocalDAM4SAMTracker()
+
+    def _snapshot_latest_blocking(
+        self,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray],
+               Optional[np.ndarray], object]:
+        """Block until the RGB callback has produced a frame newer than the
+        previous tracker step, then return (rgb, depth, K, stamp). Returns
+        (None, ..., ...) if the stop event fires or we wait > 5 s."""
+        wait_start = time.time()
+        last_stamp = self._latest_stamp_seen_by_worker
+        while not self._stop.is_set():
+            with self._snap_lock:
+                rgb = self._latest_rgb
+                depth = self._latest_depth
+                K = self._latest_K
+                stamp = self._latest_stamp
+            if (rgb is not None and depth is not None and K is not None
+                    and stamp is not last_stamp):
+                self._latest_stamp_seen_by_worker = stamp
+                return rgb, depth, K, stamp
+            if time.time() - wait_start > 5.0:
+                return None, None, None, None
+            time.sleep(0.005)
+        return None, None, None, None
+
+    def _make_result(self, mask_np: np.ndarray) -> TrackResult:
+        coords = np.argwhere(mask_np)
+        h, w = mask_np.shape
+        min_area = max(
+            20, int(h * w * PERCEPTION_CFG["min_mask_area_ratio"]))
+        if len(coords) < min_area:
+            return TrackResult(
+                mask=None, confidence=0.0,
+                centroid_uv=None, is_visible=False)
+        v = float(coords[:, 0].mean())
+        u = float(coords[:, 1].mean())
+        area_ratio = len(coords) / float(h * w)
+        conf = float(min(1.0, area_ratio * 50.0))
+        return TrackResult(
+            mask=mask_np, confidence=conf,
+            centroid_uv=(u, v), is_visible=True)
+
+    def _push_result(self, frame_idx: int, result: TrackResult) -> None:
+        while True:
+            try:
+                self._results_q.put((frame_idx, result), block=False)
+                return
+            except queue.Full:
+                try:
+                    self._results_q.get_nowait()
+                except queue.Empty:
+                    pass
 
     # ------------------------------------------------------------------
     # Main thread — drain results, project to body frame, publish
@@ -714,31 +585,10 @@ class Dam4SamTracker(Node):
         body_y = -opt_x
         return np.array([body_x, body_y])
 
-    def _lookup_T_base_optical(self) -> Optional[np.ndarray]:
-        if self._T_base_optical is not None:
-            return self._T_base_optical
-        try:
-            tfs: TransformStamped = self._tf_buf.lookup_transform(
-                "follower/base_link", "follower/camera_optical_frame",
-                rclpy.time.Time())
-        except Exception:
-            return None
-        t = tfs.transform.translation
-        R = _quat_to_R(tfs.transform.rotation)
-        T = np.eye(4)
-        T[:3, :3] = R
-        T[:3, 3] = [t.x, t.y, t.z]
-        self._T_base_optical = T
-        return T
-
     def destroy_node(self) -> None:  # type: ignore[override]
         self._stop.set()
         self._init_event.set()
         return super().destroy_node()
-
-
-# Imported here to keep the top of the file readable.
-import time  # noqa: E402
 
 
 def main() -> None:

@@ -305,11 +305,13 @@
          translates and rotates rigidly along the patrol path.
          ============================================================== -->
     <model name="leader">
-      <!-- Leader spawns 5 m in front of the bot. At our 320×240 / 60° H-FOV
-           camera, a 1.7 m person fits fully (V-FOV ≈ 47°) only when
-           distance > ~3.9 m. Spawning at 3 m clipped the head off the
-           bbox SAM2 sees at frame 0. -->
-      <pose>5 0 0 0 0 1.5708</pose>
+      <!-- Leader spawns ~5 m in front of the camera. The follower's RGBD
+           camera sits at body-frame x=0.23 (chassis 0 + sensor 0.23), so
+           model x=5.5 puts the leader's body center 5.27 m from the camera.
+           At 320×240 / 60° H-FOV (V-FOV ≈ 47°), a 1.7 m person fits fully
+           only when distance > ~3.9 m; the extra 1 m of margin keeps the
+           full body visible even when the bot is mid-rotation at frame 0. -->
+      <pose>5.5 0 0 0 0 1.5708</pose>
 
       <link name="body">
         <inertial>

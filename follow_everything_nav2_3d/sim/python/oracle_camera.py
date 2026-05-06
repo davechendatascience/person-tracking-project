@@ -35,7 +35,12 @@ from vision_msgs.msg import (
 
 
 PUBLISH_RATE_HZ = 20.0
-MAX_RANGE_M    = 6.0      # match the 2D sim's CameraDetector range gate
+MAX_RANGE_M    = 8.0      # leader spawns at d=5.5 (full-body-view distance)
+                          # and patrols within ±6 m of spawn, so a 6-m cap
+                          # was clipping detections on most ticks. 8 m is
+                          # the camera's actual <clip><far> in empty.world,
+                          # so this matches the rgbd sensor's effective
+                          # range rather than imposing a tighter gate.
 CAM_FOV_DEG    = 90.0     # match the rgbd_camera sensor's horizontal_fov
 
 FOLLOWER_FRAME = "follower"

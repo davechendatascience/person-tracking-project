@@ -341,11 +341,19 @@ class Blackboard:
     def obstacles(self):
         return self.learned_map.aabbs()
 
-    def update_leader_from_detection(self, body_x, body_y):
-        """Convert body-frame detection to world frame and update vel EWMA."""
-        c, s = math.cos(self.yaw), math.sin(self.yaw)
-        wx = self.x + body_x * c - body_y * s
-        wy = self.y + body_x * s + body_y * c
+    def update_leader_from_world(self, wx, wy, wx_pred=None, wy_pred=None):
+        """Update leader pose given an already-world-frame detection.
+
+        wx, wy: leader's world position at the frame's capture stamp T1.
+            Used to update the EWMA velocity (raw observations only — the
+            prediction MUST NOT feed back into the velocity estimate or it
+            will spiral).
+        wx_pred, wy_pred: optional predicted leader position at *now*,
+            advanced from (wx, wy) by leader_vel × (now − T1). Stored as
+            leader_world / last_seen so the BT plans against the predicted
+            current pose. Falls back to (wx, wy) when no prediction is
+            supplied (e.g., the body-frame back-compat path).
+        """
         now = time.time()
         # EWMA velocity update (alpha=0.4). Reject huge jumps as detection
         # noise — leader cannot exceed 1.5 m/s, so drop samples implying >3.
@@ -361,14 +369,39 @@ class Blackboard:
                     a * inst_vy + (1 - a) * self.leader_vel[1],
                 )
         self._last_obs = (now, wx, wy)
-        self.leader_world = (wx, wy)
+        out_wx = wx_pred if wx_pred is not None else wx
+        out_wy = wy_pred if wy_pred is not None else wy
+        self.leader_world = (out_wx, out_wy)
         self.leader_visible = True
         self.miss_count = 0
-        self.last_seen = (wx, wy)
+        self.last_seen = (out_wx, out_wy)
         self.last_seen_t = now
         # Re-detection: reset spiral search.
         self.spiral_radius = 0.0
         self.spiral_angle = 0.0
+        # Drop any A* path computed by a previous PlannedRecovery tick. The
+        # BT only clears recovery_path when it *arrives* near last_seen
+        # (Planning.update line 664), so a path computed during a brief
+        # occlusion lingers in the blackboard after the leader is back in
+        # view. Following/Chasing don't consume it, but the snapshot
+        # recorder draws it, which makes it look like the bot is heading
+        # somewhere it isn't. Clear it here so visualizations stay honest.
+        self.recovery_path = []
+
+    def update_leader_from_body(self, body_x, body_y):
+        """Convert body-frame detection to world frame using the *current*
+        pose, then forward to update_leader_from_world. Kept for the 2D
+        oracle camera publisher and any consumer that hasn't migrated to
+        world-frame detections yet."""
+        c, s = math.cos(self.yaw), math.sin(self.yaw)
+        wx = self.x + body_x * c - body_y * s
+        wy = self.y + body_x * s + body_y * c
+        self.update_leader_from_world(wx, wy)
+
+    # Backwards-compat shim: old call sites used this name with body-frame
+    # arguments. Route them through the body-frame helper.
+    def update_leader_from_detection(self, body_x, body_y):
+        self.update_leader_from_body(body_x, body_y)
 
     def mark_lost(self):
         # Debounce: a single missed frame doesn't mean lost. Only flip the
@@ -1300,6 +1333,12 @@ class FollowEverythingNode(Node):
         self.bb.x = msg.pose.pose.position.x
         self.bb.y = msg.pose.pose.position.y
         self.bb.yaw = yaw
+        # Track odom's sim-time stamp as our reference "sim now". The BT
+        # otherwise has no clean source of sim time (use_sim_time parameter
+        # override is fragile across rclpy versions). Used by _on_detect to
+        # compute latency = sim_now − msg.header.stamp.
+        self._latest_odom_sim_t = (
+            msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9)
 
     def _on_scan(self, msg):
         self._scan_count = getattr(self, "_scan_count", 0) + 1
@@ -1379,7 +1418,24 @@ class FollowEverythingNode(Node):
             self.bb.mark_lost()
             return
         p = msg.detections[0].results[0].pose.pose.position
-        self.bb.update_leader_from_detection(p.x, p.y)
+        if msg.header.frame_id == "follower/odom":
+            # Latency from frame capture to BT consume, in sim time. We
+            # compare msg.header.stamp (sim time, set by dam4sam from the
+            # camera frame) against the most recent /follower/odom stamp
+            # (also sim time) — both arrive on the same ROS clock so the
+            # difference is the actual perception age. Capped at 0.5 s
+            # (SAM2 large worst case + transport); a stale velocity
+            # estimate shouldn't fling a stopped-leader prediction far.
+            frame_t = (msg.header.stamp.sec
+                       + msg.header.stamp.nanosec * 1e-9)
+            odom_t = getattr(self, "_latest_odom_sim_t", frame_t)
+            latency = max(0.0, min(0.5, odom_t - frame_t))
+            vx, vy = self.bb.leader_vel
+            wx_pred = p.x + vx * latency
+            wy_pred = p.y + vy * latency
+            self.bb.update_leader_from_world(p.x, p.y, wx_pred, wy_pred)
+        else:
+            self.bb.update_leader_from_body(p.x, p.y)
 
     def _on_ped_detect(self, msg: Detection2DArray):
         body_xys = []

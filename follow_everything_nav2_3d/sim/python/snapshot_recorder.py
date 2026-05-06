@@ -151,18 +151,25 @@ class SnapshotRecorder(Node):
             (p.pose.position.x, p.pose.position.y) for p in msg.poses]
 
     def _on_detect(self, msg: Detection2DArray) -> None:
-        if not msg.detections or self.f_xyy is None:
+        if not msg.detections:
             return
         det = msg.detections[0]
         if not det.results:
             return
         if det.results[0].hypothesis.class_id != "leader":
             return
-        bx = det.results[0].pose.pose.position.x
-        by = det.results[0].pose.pose.position.y
-        fx, fy, fyaw = self.f_xyy
-        c, s = math.cos(fyaw), math.sin(fyaw)
-        self.last_seen = (fx + c * bx - s * by, fy + s * bx + c * by)
+        px = det.results[0].pose.pose.position.x
+        py = det.results[0].pose.pose.position.y
+        if msg.header.frame_id == "follower/odom":
+            # Already world-frame (publisher did the body→world lift at the
+            # frame's own timestamp — no further pose math here).
+            self.last_seen = (px, py)
+        else:
+            if self.f_xyy is None:
+                return
+            fx, fy, fyaw = self.f_xyy
+            c, s = math.cos(fyaw), math.sin(fyaw)
+            self.last_seen = (fx + c * px - s * py, fy + s * px + c * py)
         self.last_seen_t = time.time()
 
     def _draw_gt(self, ax) -> None:

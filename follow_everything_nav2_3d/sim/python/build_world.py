@@ -92,31 +92,73 @@ def aabb_sdf(idx: int, aabb) -> str:
 """
 
 
+# Match the first <pose> after a <model name="..."> opener, tolerating any
+# whitespace + SDF comments in between. `\s*` alone silently fails when a
+# multi-line `<!-- ... -->` block sits between the model tag and pose, which
+# leaves the model at the template's default position.
+_BETWEEN_TAG_AND_POSE = r'(?:\s|<!--[\s\S]*?-->)*'
+
+
 def shift_leader_waypoints(template: str, lx: float, ly: float) -> str:
     """Move the leader model's <pose> so it spawns at (lx, ly)."""
-    # The template's leader <model name="leader"><pose>3 0 0 0 0 1.5708</pose>...
-    return re.sub(
-        r'(<model name="leader">\s*<pose>)([^<]+)(</pose>)',
+    out, n = re.subn(
+        rf'(<model name="leader">{_BETWEEN_TAG_AND_POSE}<pose>)([^<]+)(</pose>)',
         rf'\g<1>{lx:.3f} {ly:.3f} 0 0 0 1.5708\g<3>',
         template,
         count=1,
     )
+    if n != 1:
+        raise RuntimeError(
+            "build_world: failed to rewrite leader <pose> — template "
+            "doesn't have a matching <model name=\"leader\">…<pose> block")
+    return out
 
 
 def shift_follower_pose(
         template: str, fx: float, fy: float, fyaw: float) -> str:
     """Move the follower model's <pose> so it spawns at (fx, fy) with yaw."""
-    return re.sub(
-        r'(<model name="follower">\s*<pose>)([^<]+)(</pose>)',
+    out, n = re.subn(
+        rf'(<model name="follower">{_BETWEEN_TAG_AND_POSE}<pose>)([^<]+)(</pose>)',
         rf'\g<1>{fx:.3f} {fy:.3f} 0 0 0 {fyaw:.4f}\g<3>',
         template,
         count=1,
     )
+    if n != 1:
+        raise RuntimeError(
+            "build_world: failed to rewrite follower <pose> — template "
+            "doesn't have a matching <model name=\"follower\">…<pose> block")
+    return out
 
 
 def insert_obstacles(template: str, obstacle_xml: str) -> str:
     """Splice obstacle <model> blocks just before </world>."""
     return template.replace("</world>", obstacle_xml + "  </world>", 1)
+
+
+# Per-map spawn overrides: the 2D maps put F and L 1.5–3 m apart for the
+# 2D project's planning tests, but 3D SAM2 init needs a full-body view of
+# the leader (V-FOV ≈ 47° → person needs >3.9 m to fit head-to-foot in
+# the frame). Below 4 m the FULL_VIEW_TIMEOUT_SEC fallback kicks in,
+# seeds SAM2 with a clipped corner bbox, and the mask latches onto a
+# nearby wall. Editing the 2D map files would change the 2D project's
+# tests too; per-map overrides here keep the shared maps untouched.
+#
+# Keys: map_name → (follower_xy, leader_xy) in world coords (gz frame).
+# Pick rows where the line between F and L is fully clear so the init
+# bbox isn't clipped by an obstacle in front of the leader.
+SPAWN_OVERRIDES = {
+    # cluttered.txt has four consecutive fully-clear rows at the bottom
+    # (j=25..28, wy=1.75..0.75). Spawn in the middle of that block on
+    # row j=27 (wy=1.25) — the leader at col 15, the follower at col 25,
+    # facing -x. With 0.5 m of clear floor on either side of the LOS line
+    # and only the bottom map wall behind the bot, no obstacle falls inside
+    # the camera's H-FOV at init. The next walls north (j=24) are 1.5 m
+    # away along the y axis and at body bearing < -36° (outside ±30° H-FOV).
+    "cluttered": ((12.75, 1.25), (7.75, 1.25)),  # 5 m, F on +x side, clean FOV
+    # forest.txt row j=2 has no obstacles between cols 8 and 18 (tree clumps
+    # start at row j=4), so we keep them on the original spawn row.
+    "forest":    ((4.25, 13.75), (9.25, 13.75)),  # 5 m, no trees in path
+}
 
 
 def main():
@@ -131,6 +173,10 @@ def main():
         return
 
     grid, leader_xy, follower_xy, (Wm, Hm) = parse_map(map_name)
+    if map_name in SPAWN_OVERRIDES:
+        follower_xy, leader_xy = SPAWN_OVERRIDES[map_name]
+        print(f"[build_world] applying spawn override for {map_name}: "
+              f"follower={follower_xy} leader={leader_xy}", file=sys.stderr)
     aabbs = merged_aabbs_from_grid(grid, CELL_M)
     print(f"[build_world] map={map_name} size={Wm}x{Hm}m "
           f"leader={leader_xy} follower={follower_xy} "

@@ -68,13 +68,14 @@ for _p in ("/ws", "/opt", "/opt/DAM4SAM"):
 # ---------------------------------------------------------------------------
 SAM2_CFG = {
     # DAM4SAM ships its own sam21pp_*.yaml configs alongside /opt/DAM4SAM/sam2/.
-    # We use the small (S) variant — ~3× faster than large at the cost of
-    # slightly weaker masks. With a 320×240 camera and a sim actor that's
-    # already low-detail, the smaller model's spatial accuracy is fine and
-    # the higher tracker rate (~7-8 Hz vs ~2.5 Hz) cuts the temporal lag
-    # the BT sees on `last_seen`.
-    "model_cfg":  "sam21pp_hiera_s.yaml",
-    "checkpoint": "/opt/sam2.1_hiera_small.pt",
+    # We use the large (L) variant for tracking robustness in cluttered
+    # scenes. The small backbone tracked the leader fine in open spaces but
+    # drifted onto wall obstacles when the leader passed behind one — its
+    # appearance head couldn't tell a person from a similarly-coloured 1×1.5m
+    # box at close range. L runs ~2.5 Hz vs S's ~7-8 Hz; we accept the
+    # higher per-frame lag in exchange for far fewer drift events.
+    "model_cfg":  "sam21pp_hiera_l.yaml",
+    "checkpoint": "/opt/sam2.1_hiera_large.pt",
     "device":     "cuda",
     "image_size": 1024,
 }
@@ -481,14 +482,20 @@ class Dam4SamTracker(Node):
     ) -> Tuple[Optional[Tuple[float, float, float]], float]:
         """Return ((x_w, y_w, yaw), skew_ms) for the buffered odom pose
         whose stamp is closest to target_ns. Returns (None, skew) if no
-        pose within 200 ms or if the buffer is empty."""
+        pose within 80 ms or if the buffer is empty.
+
+        80 ms cap chosen vs 200 ms: at the bot's max 1.5 rad/s a 200 ms
+        skew would bake 17° of yaw error into the world projection
+        (≈ 1.5 m offset at a 5 m leader distance). 80 ms keeps that under
+        7° / 0.6 m. Odom publishes at 30 Hz so the buffer is dense enough
+        to satisfy the tighter window in steady state."""
         with self._odom_lock:
             if not self._odom_buf:
                 return None, 0.0
             ns, x, y, yaw = min(
                 self._odom_buf, key=lambda kv: abs(kv[0] - target_ns))
         skew_ns = ns - target_ns
-        if abs(skew_ns) > 200_000_000:
+        if abs(skew_ns) > 80_000_000:
             return None, skew_ns / 1e6
         return (x, y, yaw), skew_ns / 1e6
 
@@ -811,7 +818,14 @@ class Dam4SamTracker(Node):
             out.header.stamp = header.stamp
         else:
             out.header.stamp = self.get_clock().now().to_msg()
-        out.header.frame_id = "follower/base_link"
+        # World-frame leader position. We do the body→world lift inside this
+        # node — using the bot's odom pose at the *frame's* stamp — so the
+        # consumer just reads world coords. The previous body-frame pattern
+        # forced every consumer to re-multiply by their *current* odom pose,
+        # which (because they ran a few ms behind us) introduced 4–8° of
+        # spurious rotation per detection. Frame "follower/odom" matches
+        # what world_odom_publisher.py emits on /follower/odom.
+        out.header.frame_id = "follower/odom"
 
         if side is None:
             self.pub.publish(out)
@@ -837,37 +851,34 @@ class Dam4SamTracker(Node):
             self.pub.publish(out)
             return
 
-        # body→world at frame time, then world→body at "now". The BT does
-        # body→world with its own current pose; without this hop the bot's
-        # rotation between frame capture and BT consumption shifts the
-        # leader's world position by up to 25° at 1.5 rad/s × 200 ms.
+        # body→world at the *frame's* timestamp. If no pose is buffered
+        # within the skew window (typical at startup before odom warms up),
+        # publish the body-frame xy with frame_id="follower/base_link" so
+        # the BT falls back to its own current-pose conversion. The BT
+        # dispatches on header.frame_id, so this is safe.
         pose_frame, _frame_skew = self._pose_at(frame_ns)
-        pose_now = self._latest_pose()
-        body_xy_pub = body_xy_frame
-        world_xy: Optional[Tuple[float, float]] = None
-        if pose_frame is not None:
+        det = Detection2D()
+        hyp = ObjectHypothesisWithPose()
+        hyp.hypothesis.class_id = "leader"
+        hyp.hypothesis.score = float(result.confidence)
+        if pose_frame is None:
+            out.header.frame_id = "follower/base_link"
+            hyp.pose.pose.position.x = float(body_xy_frame[0])
+            hyp.pose.pose.position.y = float(body_xy_frame[1])
+            self._log_world_frame(
+                None, None, self._latest_pose(),
+                body_xy_frame, body_xy_frame)
+        else:
             xf, yf, yawf = pose_frame
             cf, sf = math.cos(yawf), math.sin(yawf)
             wx = xf + cf * body_xy_frame[0] - sf * body_xy_frame[1]
             wy = yf + sf * body_xy_frame[0] + cf * body_xy_frame[1]
             world_xy = (wx, wy)
-            if pose_now is not None:
-                xn, yn, yawn = pose_now
-                cn, sn = math.cos(yawn), math.sin(yawn)
-                dx, dy = wx - xn, wy - yn
-                # Inverse rotation by yawn (R^T).
-                body_xy_pub = ( cn * dx + sn * dy,
-                               -sn * dx + cn * dy)
-
-        self._log_world_frame(
-            world_xy, pose_frame, pose_now, body_xy_frame, body_xy_pub)
-
-        det = Detection2D()
-        hyp = ObjectHypothesisWithPose()
-        hyp.hypothesis.class_id = "leader"
-        hyp.hypothesis.score = float(result.confidence)
-        hyp.pose.pose.position.x = float(body_xy_pub[0])
-        hyp.pose.pose.position.y = float(body_xy_pub[1])
+            hyp.pose.pose.position.x = float(wx)
+            hyp.pose.pose.position.y = float(wy)
+            self._log_world_frame(
+                world_xy, pose_frame, self._latest_pose(),
+                body_xy_frame, world_xy)
         det.results.append(hyp)
         out.detections.append(det)
         self.pub.publish(out)
@@ -974,34 +985,40 @@ class Dam4SamTracker(Node):
         rng_lidar, lidar_idx = self._lidar_range_with_idx(scan, bearing)
         rng_depth = self._depth_range_in_mask(mask, depth, u_pix, cx, fx)
 
-        if rng_lidar is not None and rng_depth is not None:
-            if abs(rng_lidar - rng_depth) > 1.0:
-                # Tolerance widened from 0.5 to 1.0 m: at typical leader
-                # distances the depth-in-mask median samples the body's
-                # geometric center while lidar samples whatever surface
-                # faces the bot, and the camera-vs-lidar mount offset
-                # (~0.23 m) adds further normal variance. 1.0 m still
-                # catches the failure mode (mask drift onto a wall reads
-                # 7 m+, lidar at the same bearing reads 4 m).
+        # When a mask exists, prefer depth-in-mask: the median Z across the
+        # whole mask measures the depth of the *masked object* — i.e., the
+        # leader, not whatever lidar happens to hit first along the camera
+        # ray. Lidar-primary failed in cluttered scenes when a wall sat
+        # between the bot and a partially-occluded leader: lidar returned
+        # the wall (~0.8 m), depth-in-mask returned the leader (~1.5 m),
+        # the 1.0 m cross-check passed (diff 0.7 m), and last_seen got
+        # pinned on the wall — the BT then "Followed" the static obstacle
+        # while the actual leader walked away.
+        if rng_depth is not None and rng_lidar is not None:
+            if rng_depth + 0.5 < rng_lidar:
+                # Depth says the masked object is *closer* than lidar's first
+                # hit. Sensor disagreement we can't reconcile (lidar should
+                # always see something at least as close as depth). Drop.
                 self._proj_disagree += 1
                 self._log_centroid_lidar(
-                    "DROP-disagree", uv, bearing, lidar_idx,
+                    "DROP-depth<lidar", uv, bearing, lidar_idx,
                     rng_lidar, rng_depth)
                 return None
             self._proj_both_agree += 1
-            rng = rng_lidar
+            rng = rng_depth  # trust the in-mask measurement
+            tag = "agree" if abs(rng_lidar - rng_depth) <= 1.0 else "depth-occlusion"
             self._log_centroid_lidar(
-                "agree", uv, bearing, lidar_idx, rng_lidar, rng_depth)
-        elif rng_lidar is not None:
-            self._proj_lidar_only += 1
-            rng = rng_lidar
-            self._log_centroid_lidar(
-                "lidar-only", uv, bearing, lidar_idx, rng_lidar, None)
+                tag, uv, bearing, lidar_idx, rng_lidar, rng_depth)
         elif rng_depth is not None:
             self._proj_depth_only += 1
             rng = rng_depth
             self._log_centroid_lidar(
                 "depth-only", uv, bearing, lidar_idx, None, rng_depth)
+        elif rng_lidar is not None:
+            self._proj_lidar_only += 1
+            rng = rng_lidar
+            self._log_centroid_lidar(
+                "lidar-only", uv, bearing, lidar_idx, rng_lidar, None)
         else:
             self._proj_neither += 1
             return None

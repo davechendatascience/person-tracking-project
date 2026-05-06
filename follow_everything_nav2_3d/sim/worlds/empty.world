@@ -260,25 +260,19 @@
         </collision>
       </link>
 
-      <plugin filename="ignition-gazebo-diff-drive-system"
-              name="ignition::gazebo::systems::DiffDrive">
-        <left_joint>left_wheel_joint</left_joint>
-        <right_joint>right_wheel_joint</right_joint>
-        <wheel_separation>0.5</wheel_separation>
-        <wheel_radius>0.06</wheel_radius>
-        <max_wheel_torque>200</max_wheel_torque>
+      <!-- VelocityControl, NOT DiffDrive: cmd_vel is applied as a body-frame
+           twist directly each step, kinematically. The 2D sim is fully
+           kinematic and the BT's P-controllers were tuned against that —
+           with DiffDrive's wheel torques + low joint damping the chassis
+           carried angular momentum past the BT's w=0 command, overshooting
+           target yaw and spinning past obstacles. VelocityControl makes the
+           bot stop the instant the BT commands it to.
+           Wheels are still in the URDF for the lidar mount + visual fidelity;
+           they just don't drive. JointStatePublisher still publishes their
+           (zero) state. /follower/odom comes from world_odom_publisher.py. -->
+      <plugin filename="ignition-gazebo-velocity-control-system"
+              name="ignition::gazebo::systems::VelocityControl">
         <topic>/follower/cmd_vel</topic>
-        <!-- gz's diff-drive odom is in the follower's local odom frame
-             (origin at spawn pose). The BT consumes /follower/odom as if
-             it were world-frame, which mis-places the A* grid by the
-             spawn offset. We redirect gz's odom to a parking topic and
-             use sim/python/world_odom_publisher.py to publish a true
-             world-frame /follower/odom from /gz_pose_truth instead. -->
-        <odom_topic>/follower/odom_local</odom_topic>
-        <tf_topic>/follower/tf</tf_topic>
-        <frame_id>follower/odom</frame_id>
-        <child_frame_id>chassis</child_frame_id>
-        <odom_publish_frequency>50</odom_publish_frequency>
       </plugin>
       <plugin filename="ignition-gazebo-joint-state-publisher-system"
               name="ignition::gazebo::systems::JointStatePublisher">

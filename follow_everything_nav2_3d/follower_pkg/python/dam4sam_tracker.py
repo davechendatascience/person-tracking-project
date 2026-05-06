@@ -47,6 +47,7 @@ from rclpy.node import Node
 
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import CameraInfo, Image, LaserScan
+from tf2_msgs.msg import TFMessage
 from vision_msgs.msg import (
     Detection2D,
     Detection2DArray,
@@ -100,6 +101,17 @@ CAM_OFFSET_Z_BODY = 0.15
 MAX_FRAMES = 100_000
 SIDE_DATA_KEEP = 64  # only need the most recent few for projection lookup
 
+# Leader's body extents used to project a ground-truth bbox + build a
+# depth-filtered init mask at SAM2 init. The bbox itself is generous (full
+# body); the *mask* we hand SAM2 only includes pixels inside the bbox whose
+# depth is within ±LEADER_DEPTH_TOL of the expected leader distance — that
+# rejects wall/floor pixels that share the bbox area at close range and
+# was the cause of the "last_seen lands on the wall" failure mode.
+LEADER_HALF_W = 0.30
+LEADER_HALF_H = 0.85
+LEADER_Z_CTR  = 0.85
+LEADER_DEPTH_TOL = 0.5
+
 
 # Result emitted by the worker thread for each tracker step.
 @dataclass
@@ -143,6 +155,7 @@ class Dam4SamTracker(Node):
 
         # Captured at YOLO bootstrap so SAM2 frame 0 == YOLO frame.
         self._init_bbox: Optional[np.ndarray] = None
+        self._init_mask: Optional[np.ndarray] = None  # set by oracle path
         self._init_rgb: Optional[np.ndarray] = None
         self._init_depth: Optional[np.ndarray] = None
         self._init_K: Optional[np.ndarray] = None
@@ -196,6 +209,16 @@ class Dam4SamTracker(Node):
         self.create_subscription(Image, "/follower/camera/depth_image", self._on_depth, 10)
         self.create_subscription(CameraInfo, "/follower/camera/camera_info",
                                  self._on_camera_info, 10)
+        # /gz_pose_truth — used ONLY as a fallback init seed for SAM2 when
+        # YOLO can't find the leader (low-poly actor + low-res camera fail
+        # the conf gate at distance). Once SAM2 is initialized we never
+        # consult these poses; tracking is purely visual after frame 0.
+        self._gz_follower_xyy: Optional[Tuple[float, float, float]] = None
+        self._gz_leader_xy:    Optional[Tuple[float, float]]        = None
+        self._gz_lock = threading.Lock()
+        self._first_rgb_t: Optional[float] = None
+        self.create_subscription(
+            TFMessage, "/gz_pose_truth", self._on_gz_poses, 50)
         # /follower/scan_raw — the un-filtered lidar (lidar_leader_filter strips
         # leader hits from /follower/scan; we want the raw one so beams hitting
         # the leader are still there to give us range).
@@ -242,9 +265,147 @@ class Dam4SamTracker(Node):
             self._latest_rgb = rgb
             self._latest_stamp = msg.header
         self._got_first_rgb.set()
+        if self._first_rgb_t is None:
+            self._first_rgb_t = time.time()
 
         if self._init_bbox is None:
-            self._try_yolo_bootstrap(rgb, msg.header)
+            # Oracle bootstrap is preferred — build_world spawns the bot
+            # facing the leader so the projected bbox is on the actual
+            # leader pixels at frame 0. YOLO on the low-poly actor at low
+            # camera resolution often fails the conf gate, and a delayed
+            # bootstrap (after the bot has rotated) seeded SAM2 onto walls.
+            self._try_oracle_bootstrap(rgb, msg.header)
+            if self._init_bbox is None:
+                self._try_yolo_bootstrap(rgb, msg.header)
+
+    def _on_gz_poses(self, msg: TFMessage) -> None:
+        for tr in msg.transforms:
+            t = tr.transform.translation
+            if tr.child_frame_id == "follower":
+                yaw = math.atan2(
+                    2.0 * (tr.transform.rotation.w * tr.transform.rotation.z
+                           + tr.transform.rotation.x * tr.transform.rotation.y),
+                    1.0 - 2.0 * (tr.transform.rotation.y ** 2
+                                  + tr.transform.rotation.z ** 2))
+                with self._gz_lock:
+                    self._gz_follower_xyy = (t.x, t.y, yaw)
+            elif tr.child_frame_id == "leader":
+                with self._gz_lock:
+                    self._gz_leader_xy = (t.x, t.y)
+
+    def _try_oracle_bootstrap(self, rgb: np.ndarray, header) -> None:
+        """Build a tight, depth-filtered SAM2 init mask from ground-truth
+        leader pose. The projected full-body bbox alone covered > 60% of
+        the image at our 1–2 m spawn distance — SAM2 latched onto walls
+        sharing the bbox and last_seen drifted onto the wall. Filtering the
+        bbox region by depth ≈ expected leader distance keeps only leader
+        pixels."""
+        with self._snap_lock:
+            depth = None if self._latest_depth is None else self._latest_depth.copy()
+            K = None if self._latest_K is None else self._latest_K.copy()
+        with self._gz_lock:
+            f_xyy = self._gz_follower_xyy
+            l_xy  = self._gz_leader_xy
+        if depth is None or K is None or f_xyy is None or l_xy is None:
+            return
+        bbox = self._project_leader_bbox(rgb.shape, K, f_xyy, l_xy)
+        if bbox is None:
+            return
+        x1, y1, x2, y2 = bbox
+        bbox_xywh = np.array(
+            [x1, y1, x2 - x1, y2 - y1], dtype=np.float32)
+
+        # Expected horizontal distance from camera mount to leader's body.
+        fxw, fyw, _ = f_xyy
+        lx, ly = l_xy
+        d_expected = math.hypot(lx - fxw, ly - fyw) - CAM_OFFSET_X_BODY
+        # Pixel mask: inside bbox AND depth within tolerance of expected.
+        h, w = depth.shape
+        u = np.arange(w)[None, :].repeat(h, axis=0)
+        v = np.arange(h)[:, None].repeat(w, axis=1)
+        in_bbox = (
+            (u >= int(x1)) & (u <= int(x2)) &
+            (v >= int(y1)) & (v <= int(y2)))
+        depth_ok = (
+            np.isfinite(depth)
+            & (depth > max(0.1, d_expected - LEADER_DEPTH_TOL))
+            & (depth < d_expected + LEADER_DEPTH_TOL))
+        mask = (in_bbox & depth_ok).astype(np.uint8)
+        n_on = int(mask.sum())
+        if n_on < 50:
+            self.get_logger().warn(
+                f"oracle bootstrap: depth filter found only {n_on} px in bbox "
+                f"d_expected={d_expected:.2f} m — falling back to bbox-only seed")
+            self._init_mask = None
+        else:
+            self._init_mask = mask
+
+        self._init_rgb   = rgb.copy()
+        self._init_depth = depth
+        self._init_K     = K
+        self._init_stamp = header
+        self._init_bbox  = bbox_xywh
+        self._init_event.set()
+        self.get_logger().info(
+            f"oracle bootstrap: bbox xyxy=[{x1:.0f},{y1:.0f},{x2:.0f},{y2:.0f}] "
+            f"d_expected={d_expected:.2f}m mask_px={n_on}")
+
+    @staticmethod
+    def _project_leader_bbox(
+        img_shape, K: np.ndarray,
+        f_xyy: Tuple[float, float, float],
+        l_xy:  Tuple[float, float],
+    ) -> Optional[Tuple[float, float, float, float]]:
+        """Project an axis-aligned 3D box around the leader's body to image
+        pixel coords. Returns (x1, y1, x2, y2) clipped to the image, or None
+        if the leader is fully outside the FOV."""
+        h, w = img_shape[:2]
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+        fxw, fyw, fyaw = f_xyy
+        lx, ly = l_xy
+        cosY, sinY = math.cos(fyaw), math.sin(fyaw)
+
+        u_min = float("inf"); v_min = float("inf")
+        u_max = -float("inf"); v_max = -float("inf")
+        any_in_front = False
+        for dx in (-LEADER_HALF_W, LEADER_HALF_W):
+            for dy in (-LEADER_HALF_W, LEADER_HALF_W):
+                for dz in (-LEADER_HALF_H, LEADER_HALF_H):
+                    # World-frame corner.
+                    wx = lx + dx
+                    wy = ly + dy
+                    wz = LEADER_Z_CTR + dz
+                    # World → body frame (inverse rotation by bot yaw,
+                    # then subtract bot xy).
+                    rx = wx - fxw
+                    ry = wy - fyw
+                    body_x =  cosY * rx + sinY * ry
+                    body_y = -sinY * rx + cosY * ry
+                    body_z = wz
+                    # Body → optical frame (the URDF camera mount):
+                    # opt is at (CAM_OFFSET_X_BODY, 0, CAM_OFFSET_Z_BODY)
+                    # in body frame, pointing along body +x.
+                    opt_z = body_x - CAM_OFFSET_X_BODY
+                    if opt_z <= 0.05:
+                        continue  # behind / inside camera; skip this corner
+                    any_in_front = True
+                    opt_x = -body_y
+                    opt_y = -(body_z - CAM_OFFSET_Z_BODY)
+                    u = fx * opt_x / opt_z + cx
+                    v = fy * opt_y / opt_z + cy
+                    u_min = min(u_min, u); v_min = min(v_min, v)
+                    u_max = max(u_max, u); v_max = max(v_max, v)
+        if not any_in_front:
+            return None
+        # Clip to image. If the projected box is fully outside the frame,
+        # SAM2 has nothing to seed from.
+        x1 = max(0.0, min(w - 1.0, u_min))
+        y1 = max(0.0, min(h - 1.0, v_min))
+        x2 = max(0.0, min(w - 1.0, u_max))
+        y2 = max(0.0, min(h - 1.0, v_max))
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            return None
+        return (x1, y1, x2, y2)
 
     def _on_scan(self, msg: LaserScan) -> None:
         ns = _stamp_to_ns(msg.header.stamp)
@@ -398,9 +559,14 @@ class Dam4SamTracker(Node):
 
         init_pil = PILImage.fromarray(self._init_rgb)
         try:
+            # Prefer the depth-filtered oracle mask when available — it's
+            # already restricted to leader pixels, so SAM2 doesn't have to
+            # disambiguate from a wall-contaminated bbox.
+            init_mask = self._init_mask
+            init_bbox = (None if init_mask is not None
+                         else self._init_bbox.astype(np.float32).tolist())
             out_dict = tracker.initialize(
-                init_pil, init_mask=None,
-                bbox=self._init_bbox.astype(np.float32).tolist())
+                init_pil, init_mask=init_mask, bbox=init_bbox)
         except Exception as e:
             import traceback
             log.error(f"DAM4SAM initialize crashed: {e!r}\n{traceback.format_exc()}")

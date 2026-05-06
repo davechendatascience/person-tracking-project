@@ -305,7 +305,11 @@
          translates and rotates rigidly along the patrol path.
          ============================================================== -->
     <model name="leader">
-      <pose>3 0 0 0 0 1.5708</pose>
+      <!-- Leader spawns 5 m in front of the bot. At our 320×240 / 60° H-FOV
+           camera, a 1.7 m person fits fully (V-FOV ≈ 47°) only when
+           distance > ~3.9 m. Spawning at 3 m clipped the head off the
+           bbox SAM2 sees at frame 0. -->
+      <pose>5 0 0 0 0 1.5708</pose>
 
       <link name="body">
         <inertial>

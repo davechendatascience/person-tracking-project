@@ -111,6 +111,10 @@ LEADER_HALF_W = 0.30
 LEADER_HALF_H = 0.85
 LEADER_Z_CTR  = 0.85
 LEADER_DEPTH_TOL = 0.5
+# Wait this long for the leader to walk into a non-clipped pose before
+# falling back to a head-clipped seed. The leader patrol moves at ~0.7 m/s
+# so within a few seconds it usually drifts past the 4 m full-view distance.
+FULL_VIEW_TIMEOUT_SEC = 5.0
 
 
 # Result emitted by the worker thread for each tracker step.
@@ -299,7 +303,14 @@ class Dam4SamTracker(Node):
         the image at our 1–2 m spawn distance — SAM2 latched onto walls
         sharing the bbox and last_seen drifted onto the wall. Filtering the
         bbox region by depth ≈ expected leader distance keeps only leader
-        pixels."""
+        pixels.
+
+        Also waits for the leader to be in *full body view* (no clipping at
+        the image edges) before seeding — a head-clipped seed produces a
+        DRM template that doesn't match the leader's actual silhouette
+        when they later move further away. Falls back to the clipped seed
+        after FULL_VIEW_TIMEOUT_SEC so maps where the leader can't walk
+        far enough still bootstrap eventually."""
         with self._snap_lock:
             depth = None if self._latest_depth is None else self._latest_depth.copy()
             K = None if self._latest_K is None else self._latest_K.copy()
@@ -308,9 +319,20 @@ class Dam4SamTracker(Node):
             l_xy  = self._gz_leader_xy
         if depth is None or K is None or f_xyy is None or l_xy is None:
             return
-        bbox = self._project_leader_bbox(rgb.shape, K, f_xyy, l_xy)
-        if bbox is None:
+        bbox_full = self._project_leader_bbox(rgb.shape, K, f_xyy, l_xy)
+        if bbox_full is None:
             return
+        bbox, fully_in_view = bbox_full
+        if not fully_in_view:
+            elapsed = (time.time() - self._first_rgb_t
+                       if self._first_rgb_t is not None else 0.0)
+            if elapsed < FULL_VIEW_TIMEOUT_SEC:
+                # Leader is too close (head clipped) — wait for it to walk
+                # farther so SAM2 sees the whole body.
+                return
+            self.get_logger().warn(
+                f"oracle bootstrap: full-view timeout after {elapsed:.1f}s — "
+                f"seeding with clipped bbox")
         x1, y1, x2, y2 = bbox
         bbox_xywh = np.array(
             [x1, y1, x2 - x1, y2 - y1], dtype=np.float32)
@@ -355,10 +377,12 @@ class Dam4SamTracker(Node):
         img_shape, K: np.ndarray,
         f_xyy: Tuple[float, float, float],
         l_xy:  Tuple[float, float],
-    ) -> Optional[Tuple[float, float, float, float]]:
+    ) -> Optional[Tuple[Tuple[float, float, float, float], bool]]:
         """Project an axis-aligned 3D box around the leader's body to image
-        pixel coords. Returns (x1, y1, x2, y2) clipped to the image, or None
-        if the leader is fully outside the FOV."""
+        pixel coords. Returns ((x1, y1, x2, y2), fully_in_view) where the
+        bbox is clipped to the image, and fully_in_view is True iff the
+        unclipped projection fit entirely within the image (no head/foot
+        cropping). None if leader is entirely outside the FOV."""
         h, w = img_shape[:2]
         fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
         fxw, fyw, fyaw = f_xyy
@@ -397,15 +421,16 @@ class Dam4SamTracker(Node):
                     u_max = max(u_max, u); v_max = max(v_max, v)
         if not any_in_front:
             return None
-        # Clip to image. If the projected box is fully outside the frame,
-        # SAM2 has nothing to seed from.
+        fully_in_view = (
+            u_min >= 0.0 and u_max <= w - 1.0
+            and v_min >= 0.0 and v_max <= h - 1.0)
         x1 = max(0.0, min(w - 1.0, u_min))
         y1 = max(0.0, min(h - 1.0, v_min))
         x2 = max(0.0, min(w - 1.0, u_max))
         y2 = max(0.0, min(h - 1.0, v_max))
         if x2 - x1 < 4 or y2 - y1 < 4:
             return None
-        return (x1, y1, x2, y2)
+        return ((x1, y1, x2, y2), fully_in_view)
 
     def _on_scan(self, msg: LaserScan) -> None:
         ns = _stamp_to_ns(msg.header.stamp)

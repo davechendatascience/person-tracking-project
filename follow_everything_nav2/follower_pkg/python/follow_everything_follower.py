@@ -925,7 +925,14 @@ class SpiralExpand(_Leaf):
             self._reached_center = False
             self._anchored_t = self.bb.last_seen_t
             self.bb.spiral_radius = 0.0
-            self.bb.spiral_angle = 0.0
+            # Seed phase-2 angle to the leader's last-known travel
+            # direction so the search begins where the leader exited,
+            # not hardcoded east. Falls back to 0 if leader_vel is
+            # below the EWMA noise floor.
+            vx, vy = self.bb.leader_vel
+            self.bb.spiral_angle = (
+                math.atan2(vy, vx)
+                if math.hypot(vx, vy) > 0.05 else 0.0)
 
         # Phase 1: head directly to the predicted leader pose.
         if not self._reached_center:

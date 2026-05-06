@@ -30,11 +30,12 @@ import os
 # under our pruning loop below.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+import math
 import sys
 import threading
 import queue
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
@@ -44,7 +45,8 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 
-from sensor_msgs.msg import CameraInfo, Image
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import CameraInfo, Image, LaserScan
 from vision_msgs.msg import (
     Detection2D,
     Detection2DArray,
@@ -120,6 +122,11 @@ def _msg_to_depth(msg: Image) -> np.ndarray:
     return np.frombuffer(msg.data, dtype=np.float32).reshape(msg.height, msg.width)
 
 
+def _stamp_to_ns(t) -> int:
+    """builtin_interfaces/Time → integer nanoseconds since epoch."""
+    return int(t.sec) * 1_000_000_000 + int(t.nanosec)
+
+
 # ---------------------------------------------------------------------------
 class Dam4SamTracker(Node):
     def __init__(self) -> None:
@@ -153,10 +160,49 @@ class Dam4SamTracker(Node):
         self._results_q: "queue.Queue[Tuple[int, object]]" = queue.Queue(maxsize=4)
         self._stop = threading.Event()
 
+        # Projection-path diagnostics. Logged once a second so we can see at
+        # a glance whether lidar is reaching us and whether the cross-check
+        # is dropping frames. Hot-path counters; no lock needed for these
+        # int increments under CPython's GIL.
+        self._proj_lidar_only = 0
+        self._proj_depth_only = 0
+        self._proj_both_agree = 0
+        self._proj_disagree = 0
+        self._proj_neither = 0
+        self._centroid_log_n = 0
+        self._last_scan_skew_ms = 0.0  # set in _publish_results
+
+        # Time-aligned lidar buffer. The tracker runs ~7 Hz so by the time we
+        # project a centroid to body-frame xy, the bot may have rotated ~17°
+        # since the camera frame was captured. Sampling lidar at "now" would
+        # use a beam pointing in a different direction. Instead we keep ~2 s
+        # of recent scans and pick the one whose stamp is closest to the
+        # camera frame's stamp.
+        self._scan_buf: "deque[Tuple[int, LaserScan]]" = deque(maxlen=40)
+        self._scan_lock = threading.Lock()
+
+        # Odom buffer with the same time-alignment idea. Lets us:
+        #   1. Convert body-frame xy at frame time → world frame (for log).
+        #   2. Convert world frame → body frame at "now" before publishing,
+        #      so the BT (which does body→world with its own current pose)
+        #      lands the leader at the right world xy. Otherwise the bot's
+        #      rotation between frame capture and BT consumption (up to
+        #      ~25° at 1.5 rad/s × 200 ms) systematically biases the
+        #      world-frame leader position.
+        self._odom_buf: "deque[Tuple[int, float, float, float]]" = deque(maxlen=80)
+        self._odom_lock = threading.Lock()
+
         self.create_subscription(Image, "/follower/camera/image", self._on_rgb, 10)
         self.create_subscription(Image, "/follower/camera/depth_image", self._on_depth, 10)
         self.create_subscription(CameraInfo, "/follower/camera/camera_info",
                                  self._on_camera_info, 10)
+        # /follower/scan_raw — the un-filtered lidar (lidar_leader_filter strips
+        # leader hits from /follower/scan; we want the raw one so beams hitting
+        # the leader are still there to give us range).
+        self.create_subscription(LaserScan, "/follower/scan_raw", self._on_scan, 10)
+        # /follower/odom — already shifted to first-quadrant world by
+        # world_odom_publisher.py (matches the frame the BT uses).
+        self.create_subscription(Odometry, "/follower/odom", self._on_odom, 20)
         self.pub = self.create_publisher(
             Detection2DArray, "/follower/camera/detections_dam4sam", 10)
         # Debug overlay — RGB frame SAM2 actually processed, with mask
@@ -167,6 +213,7 @@ class Dam4SamTracker(Node):
 
         # 50 Hz drain — non-blocking. Whenever SAM2 has yielded, we publish.
         self.create_timer(0.02, self._publish_results)
+        self.create_timer(2.0, self._log_proj_stats)
         self._worker = threading.Thread(target=self._tracker_worker, daemon=True)
         self._worker.start()
 
@@ -199,6 +246,88 @@ class Dam4SamTracker(Node):
         if self._init_bbox is None:
             self._try_yolo_bootstrap(rgb, msg.header)
 
+    def _on_scan(self, msg: LaserScan) -> None:
+        ns = _stamp_to_ns(msg.header.stamp)
+        with self._scan_lock:
+            empty_before = not self._scan_buf
+            self._scan_buf.append((ns, msg))
+        if empty_before:
+            n = len(msg.ranges)
+            finite = [r for r in msg.ranges if math.isfinite(r)]
+            min_str = f"{min(finite):.2f}" if finite else "nan"
+            max_str = f"{max(finite):.2f}" if finite else "nan"
+            self.get_logger().info(
+                f"first scan: n={n} angle_min={msg.angle_min:.3f} "
+                f"angle_max={msg.angle_max:.3f} inc={msg.angle_increment:.4f} "
+                f"range_min={msg.range_min:.2f} range_max={msg.range_max:.2f} "
+                f"finite_beams={len(finite)} "
+                f"min_finite={min_str} max_finite={max_str}")
+
+    def _log_proj_stats(self) -> None:
+        with self._scan_lock:
+            buf_len = len(self._scan_buf)
+        total = (self._proj_lidar_only + self._proj_depth_only
+                 + self._proj_both_agree + self._proj_disagree
+                 + self._proj_neither)
+        if total == 0 and buf_len == 0:
+            return
+        self.get_logger().info(
+            f"proj: scan_buf={buf_len} "
+            f"lidar+depth_agree={self._proj_both_agree} "
+            f"disagree={self._proj_disagree} "
+            f"lidar_only={self._proj_lidar_only} "
+            f"depth_only={self._proj_depth_only} "
+            f"neither={self._proj_neither}")
+
+    def _on_odom(self, msg: Odometry) -> None:
+        ns = _stamp_to_ns(msg.header.stamp)
+        p = msg.pose.pose
+        q = p.orientation
+        # yaw from quaternion
+        yaw = math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        with self._odom_lock:
+            self._odom_buf.append((ns, p.position.x, p.position.y, yaw))
+
+    def _pose_at(
+        self, target_ns: int,
+    ) -> Tuple[Optional[Tuple[float, float, float]], float]:
+        """Return ((x_w, y_w, yaw), skew_ms) for the buffered odom pose
+        whose stamp is closest to target_ns. Returns (None, skew) if no
+        pose within 200 ms or if the buffer is empty."""
+        with self._odom_lock:
+            if not self._odom_buf:
+                return None, 0.0
+            ns, x, y, yaw = min(
+                self._odom_buf, key=lambda kv: abs(kv[0] - target_ns))
+        skew_ns = ns - target_ns
+        if abs(skew_ns) > 200_000_000:
+            return None, skew_ns / 1e6
+        return (x, y, yaw), skew_ns / 1e6
+
+    def _latest_pose(self) -> Optional[Tuple[float, float, float]]:
+        with self._odom_lock:
+            if not self._odom_buf:
+                return None
+            _, x, y, yaw = self._odom_buf[-1]
+            return (x, y, yaw)
+
+    def _scan_at(self, target_ns: int) -> Tuple[Optional[LaserScan], float]:
+        """Return (scan, skew_ms) where scan is the buffered LaserScan whose
+        stamp is closest to target_ns, and skew_ms = scan_stamp - frame_stamp
+        in milliseconds. Returns (None, 0.0) if buffer is empty or nothing
+        within 200 ms (a safety bound — a half-second-old scan would have
+        the bot pointing 40°+ away from where it was at frame capture)."""
+        with self._scan_lock:
+            if not self._scan_buf:
+                return None, 0.0
+            ns, scan = min(self._scan_buf, key=lambda kv: abs(kv[0] - target_ns))
+        skew_ns = ns - target_ns
+        if abs(skew_ns) > 200_000_000:
+            return None, skew_ns / 1e6
+        return scan, skew_ns / 1e6
+
     def _try_yolo_bootstrap(self, rgb: np.ndarray, header) -> None:
         if self._yolo is None:
             from ultralytics import YOLO
@@ -216,7 +345,12 @@ class Dam4SamTracker(Node):
         if not person_mask.any():
             return
         i = int(np.argmax(np.where(person_mask, conf, -1.0)))
-        bbox = xyxy[i].astype(np.float32)
+        x1, y1, x2, y2 = xyxy[i].astype(np.float32)
+        # DAM4SAM/dam4sam_tracker.py:278 expects [x, y, w, h] and computes
+        # [x, y, x+w, y+h]. Passing YOLO's xyxy directly produced a box
+        # ~10× the actual person area, contaminating the DRM template with
+        # background — visible as occasional mask drift onto walls/shadow.
+        bbox_xywh = np.array([x1, y1, x2 - x1, y2 - y1], dtype=np.float32)
 
         with self._snap_lock:
             depth = None if self._latest_depth is None else self._latest_depth.copy()
@@ -228,10 +362,11 @@ class Dam4SamTracker(Node):
         self._init_depth = depth
         self._init_K     = K
         self._init_stamp = header
-        self._init_bbox  = bbox
+        self._init_bbox  = bbox_xywh
         self._init_event.set()
         self.get_logger().info(
-            f"YOLO bootstrap: init bbox {bbox.tolist()} (conf {conf[i]:.2f})")
+            f"YOLO bootstrap: init bbox xyxy=[{x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f}] "
+            f"→ xywh={bbox_xywh.tolist()} (conf {conf[i]:.2f})")
 
     # ------------------------------------------------------------------
     # Worker thread — full DAM4SAM tracker, one track() per ROS frame.
@@ -471,18 +606,25 @@ class Dam4SamTracker(Node):
         if latest is None:
             return  # nothing new — don't republish stale
 
-        out = Detection2DArray()
-        out.header.stamp = self.get_clock().now().to_msg()
-        out.header.frame_id = "follower/base_link"
-
         frame_idx, result = latest
 
         with self._side_lock:
             side = self._side_data.get(frame_idx)
+
+        out = Detection2DArray()
+        # Honest stamp = the camera frame's stamp, not now(). Lets any
+        # downstream freshness gate see the real perception age (typically
+        # 100–300 ms behind real time at the tracker's rate).
+        if side is not None:
+            rgb, depth, K, header = side
+            out.header.stamp = header.stamp
+        else:
+            out.header.stamp = self.get_clock().now().to_msg()
+        out.header.frame_id = "follower/base_link"
+
         if side is None:
             self.pub.publish(out)
             return
-        rgb, depth, K, _ = side
 
         # Always publish the overlay — even when result.is_visible is False
         # we want to see "SAM2 saw nothing this frame" in the debug stream.
@@ -492,20 +634,81 @@ class Dam4SamTracker(Node):
             self.pub.publish(out)
             return
 
-        body_xy = self._project_to_base_link(result.centroid_uv, depth, K)
-        if body_xy is None:
+        # Time-aligned lidar lookup: find the scan whose stamp is closest to
+        # the camera frame's stamp. Prevents bot rotation between frame
+        # capture and projection from biasing the bearing→beam mapping.
+        frame_ns = _stamp_to_ns(header.stamp)
+        scan, scan_skew_ms = self._scan_at(frame_ns)
+        self._last_scan_skew_ms = scan_skew_ms
+        body_xy_frame = self._project_to_base_link(
+            result.centroid_uv, result.mask, depth, K, scan)
+        if body_xy_frame is None:
             self.pub.publish(out)
             return
+
+        # body→world at frame time, then world→body at "now". The BT does
+        # body→world with its own current pose; without this hop the bot's
+        # rotation between frame capture and BT consumption shifts the
+        # leader's world position by up to 25° at 1.5 rad/s × 200 ms.
+        pose_frame, _frame_skew = self._pose_at(frame_ns)
+        pose_now = self._latest_pose()
+        body_xy_pub = body_xy_frame
+        world_xy: Optional[Tuple[float, float]] = None
+        if pose_frame is not None:
+            xf, yf, yawf = pose_frame
+            cf, sf = math.cos(yawf), math.sin(yawf)
+            wx = xf + cf * body_xy_frame[0] - sf * body_xy_frame[1]
+            wy = yf + sf * body_xy_frame[0] + cf * body_xy_frame[1]
+            world_xy = (wx, wy)
+            if pose_now is not None:
+                xn, yn, yawn = pose_now
+                cn, sn = math.cos(yawn), math.sin(yawn)
+                dx, dy = wx - xn, wy - yn
+                # Inverse rotation by yawn (R^T).
+                body_xy_pub = ( cn * dx + sn * dy,
+                               -sn * dx + cn * dy)
+
+        self._log_world_frame(
+            world_xy, pose_frame, pose_now, body_xy_frame, body_xy_pub)
 
         det = Detection2D()
         hyp = ObjectHypothesisWithPose()
         hyp.hypothesis.class_id = "leader"
         hyp.hypothesis.score = float(result.confidence)
-        hyp.pose.pose.position.x = float(body_xy[0])
-        hyp.pose.pose.position.y = float(body_xy[1])
+        hyp.pose.pose.position.x = float(body_xy_pub[0])
+        hyp.pose.pose.position.y = float(body_xy_pub[1])
         det.results.append(hyp)
         out.detections.append(det)
         self.pub.publish(out)
+
+    def _log_world_frame(
+        self,
+        world_xy: Optional[Tuple[float, float]],
+        pose_frame: Optional[Tuple[float, float, float]],
+        pose_now: Optional[Tuple[float, float, float]],
+        body_xy_frame: np.ndarray,
+        body_xy_pub,
+    ) -> None:
+        if self._centroid_log_n % 10 != 0:
+            return  # piggyback on the centroid log cadence
+        if world_xy is None or pose_frame is None:
+            return
+        xf, yf, yawf = pose_frame
+        bx_f, by_f = float(body_xy_frame[0]), float(body_xy_frame[1])
+        bx_p, by_p = float(body_xy_pub[0]),   float(body_xy_pub[1])
+        wx, wy = world_xy
+        if pose_now is not None:
+            yawn = pose_now[2]
+            dyaw_deg = math.degrees(
+                (yawn - yawf + math.pi) % (2 * math.pi) - math.pi)
+        else:
+            dyaw_deg = 0.0
+        self.get_logger().info(
+            f"world: leader_w=({wx:+.2f},{wy:+.2f}) "
+            f"bot_w_frame=({xf:+.2f},{yf:+.2f},{math.degrees(yawf):+.0f}°) "
+            f"body_xy_frame=({bx_f:+.2f},{by_f:+.2f}) "
+            f"body_xy_pub=({bx_p:+.2f},{by_p:+.2f}) "
+            f"Δyaw_now-frame={dyaw_deg:+.1f}°")
 
     # ------------------------------------------------------------------
     def _publish_overlay(self, rgb: np.ndarray, result, frame_idx: int) -> None:
@@ -549,45 +752,154 @@ class Dam4SamTracker(Node):
     def _project_to_base_link(
         self,
         uv: Tuple[float, float],
+        mask: Optional[np.ndarray],
         depth: np.ndarray,
         K: np.ndarray,
+        scan: Optional[LaserScan],
     ) -> Optional[np.ndarray]:
+        """Project mask centroid to body-frame (x, y), preferring lidar range
+        at the bearing of the camera ray, with depth-inside-mask as fallback.
+
+        Why hybrid: depth at the centroid pixel is brittle — when DAM4SAM's
+        mask is U-shaped or split, the centroid lands on background and the
+        7×7-patch median picks up wall/floor depth (8–12 m) instead of the
+        leader, projecting the leader to a phantom point 4–8 m past where
+        they actually are. Lidar at the same bearing gives a single robust
+        scalar; sampling depth across the *whole mask* (not at one pixel)
+        also avoids that failure. Cross-check between the two catches the
+        residual case where DAM4SAM has drifted onto background.
+        """
         h, w = depth.shape
-        # `video_res_masks` is what produced this centroid; that path runs
-        # `predictor._get_orig_video_res_output(...)`, which returns the
-        # mask at the *original video resolution* — i.e. the same (w, h)
-        # as the depth image. The centroid is already in pixel coords;
-        # do NOT rescale by SAM2_CFG["image_size"]. (Earlier code did,
-        # which projected u,v ≈ 50,28 instead of 160,120 for a centered
-        # leader, hit the sky-pixel finite==0 fallback, and dropped
-        # every detection.)
-        u_pix = float(uv[0])
-        v_pix = float(uv[1])
+        u_pix, v_pix = float(uv[0]), float(uv[1])
         u_i, v_i = int(u_pix), int(v_pix)
         if not (0 <= u_i < w and 0 <= v_i < h):
             return None
 
-        r = 3
-        patch = depth[max(0, v_i-r):v_i+r+1, max(0, u_i-r):u_i+r+1]
-        finite = patch[np.isfinite(patch) & (patch > 0.1)]
-        if finite.size == 0:
-            return None
-        d = float(np.median(finite))
+        fx, _fy, cx, _cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+        # Body-frame bearing of the camera ray (x fwd, y left, REP-103).
+        # Optical x-right maps to body y-left negated.
+        bearing = math.atan2(-(u_pix - cx), fx)
 
-        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
-        # Optical frame: x right, y down, z forward (REP-103 camera).
-        opt_x = (u_pix - cx) * d / fx
-        opt_y = (v_pix - cy) * d / fy
-        opt_z = d
-        # Hardcoded optical → base_link transform — mirrors oracle_camera's
-        # body→optical math in reverse, since gz_bridge doesn't publish
-        # follower/camera_optical_frame to /tf and tf2 lookup fails. The
-        # camera is mounted (CAM_OFFSET_X_BODY, 0, CAM_OFFSET_Z_BODY)
-        # forward + up of base_link, no rotation other than the standard
-        # optical-to-body axis convention.
-        body_x = opt_z + CAM_OFFSET_X_BODY
-        body_y = -opt_x
+        rng_lidar, lidar_idx = self._lidar_range_with_idx(scan, bearing)
+        rng_depth = self._depth_range_in_mask(mask, depth, u_pix, cx, fx)
+
+        if rng_lidar is not None and rng_depth is not None:
+            if abs(rng_lidar - rng_depth) > 1.0:
+                # Tolerance widened from 0.5 to 1.0 m: at typical leader
+                # distances the depth-in-mask median samples the body's
+                # geometric center while lidar samples whatever surface
+                # faces the bot, and the camera-vs-lidar mount offset
+                # (~0.23 m) adds further normal variance. 1.0 m still
+                # catches the failure mode (mask drift onto a wall reads
+                # 7 m+, lidar at the same bearing reads 4 m).
+                self._proj_disagree += 1
+                self._log_centroid_lidar(
+                    "DROP-disagree", uv, bearing, lidar_idx,
+                    rng_lidar, rng_depth)
+                return None
+            self._proj_both_agree += 1
+            rng = rng_lidar
+            self._log_centroid_lidar(
+                "agree", uv, bearing, lidar_idx, rng_lidar, rng_depth)
+        elif rng_lidar is not None:
+            self._proj_lidar_only += 1
+            rng = rng_lidar
+            self._log_centroid_lidar(
+                "lidar-only", uv, bearing, lidar_idx, rng_lidar, None)
+        elif rng_depth is not None:
+            self._proj_depth_only += 1
+            rng = rng_depth
+            self._log_centroid_lidar(
+                "depth-only", uv, bearing, lidar_idx, None, rng_depth)
+        else:
+            self._proj_neither += 1
+            return None
+
+        # Treat range as along the camera ray (small bias from the 0.23 m
+        # camera→body offset; absorbed by the 0.5 m cross-check tolerance).
+        body_x = CAM_OFFSET_X_BODY + rng * math.cos(bearing)
+        body_y = rng * math.sin(bearing)
         return np.array([body_x, body_y])
+
+    @staticmethod
+    def _lidar_range_with_idx(
+        scan: Optional[LaserScan], bearing: float,
+    ) -> Tuple[Optional[float], Optional[int]]:
+        """Find the finite lidar return closest in bearing to the camera ray.
+        Returns (range, idx_used) — idx_used is None when no hit found.
+
+        When the camera sees the leader, no obstacle blocks the line of
+        sight — so a lidar beam pointing at the same bearing must also
+        return the leader's range. The centroid-derived idx may be a beam
+        or two off because of the camera/lidar mount offset and integer
+        rounding (and an empty-world scan returns inf on every beam except
+        the one(s) actually hitting the leader: a 0.4 m body at 5 m
+        subtends < 1 bin at 5°/bin). So we expand outward from the
+        centroid idx and take the first finite hit. Capped at ±5 bins
+        (±25°) so we don't accidentally bind to an unrelated obstacle on
+        the other side of the bot.
+        """
+        if scan is None or scan.angle_increment <= 0.0:
+            return None, None
+        n = len(scan.ranges)
+        idx0 = int(round((bearing - scan.angle_min) / scan.angle_increment))
+        if not (0 <= idx0 < n):
+            return None, None
+        for delta in range(6):
+            for sign in (0,) if delta == 0 else (-1, 1):
+                i = idx0 + sign * delta
+                if 0 <= i < n:
+                    r = scan.ranges[i]
+                    if math.isfinite(r) and scan.range_min < r < scan.range_max:
+                        return float(r), i
+        return None, idx0
+
+    def _log_centroid_lidar(
+        self,
+        tag: str,
+        uv: Tuple[float, float],
+        bearing: float,
+        lidar_idx: Optional[int],
+        rng_lidar: Optional[float],
+        rng_depth: Optional[float],
+    ) -> None:
+        """Periodic log: centroid → bearing → lidar bin → range, with the
+        time-skew between the camera frame and the chosen scan so the
+        time-alignment is verifiable."""
+        self._centroid_log_n += 1
+        if self._centroid_log_n % 10 != 0:
+            return
+        rng_l_str = f"{rng_lidar:.2f}" if rng_lidar is not None else "—"
+        rng_d_str = f"{rng_depth:.2f}" if rng_depth is not None else "—"
+        idx_str = str(lidar_idx) if lidar_idx is not None else "—"
+        self.get_logger().info(
+            f"centroid: uv=({uv[0]:.0f},{uv[1]:.0f}) "
+            f"bearing={math.degrees(bearing):+.1f}° "
+            f"lidar_idx={idx_str} rng_lidar={rng_l_str}m "
+            f"rng_depth={rng_d_str}m frame_vs_scan_dt_ms={self._last_scan_skew_ms:+.0f} "
+            f"[{tag}]")
+
+    @staticmethod
+    def _depth_range_in_mask(
+        mask: Optional[np.ndarray],
+        depth: np.ndarray,
+        u_pix: float, cx: float, fx: float,
+    ) -> Optional[float]:
+        if mask is None or mask.shape != depth.shape:
+            return None
+        m = mask.astype(bool)
+        if not m.any():
+            return None
+        d = depth[m]
+        d = d[np.isfinite(d) & (d > 0.1) & (d < 20.0)]
+        if d.size < 5:
+            return None
+        # Median Z over the entire mask — robust to silhouette edges and
+        # background pixels that the centroid-only patch was hitting.
+        z_med = float(np.median(d))
+        # Convert orthogonal Z (perpendicular to image plane) to range
+        # along the ray from the camera origin: rng = Z·sec(bearing).
+        return z_med * math.sqrt(1.0 + ((u_pix - cx) / fx) ** 2)
 
     def destroy_node(self) -> None:  # type: ignore[override]
         self._stop.set()

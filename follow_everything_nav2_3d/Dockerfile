@@ -73,7 +73,9 @@ RUN pip install --no-cache-dir \
         ultralytics \
         tqdm \
         scipy \
-        py_trees
+        py_trees \
+        vot-toolkit==0.7.1 \
+        vot-trax==4.0.2
 
 WORKDIR /ws
 # PYTHONPATH:

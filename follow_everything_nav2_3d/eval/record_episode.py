@@ -131,9 +131,14 @@ spawn("leader", [
 ], env=leader_env)
 
 # World-frame odom for the BT — replaces gz's local-frame odom.
+# EP_MAP gates WORLD_ORIGIN_OFFSET inside world_odom_publisher.py so the
+# bot's published pose lands inside the BT's planning grid (empty needs
+# +7.5,+7.5 to escape gz's centered origin; map-file worlds don't).
+odom_env = dict(os.environ)
+odom_env["EP_MAP"] = MAP
 spawn("world", [
     "python3", "-u", f"{WS}/sim/python/world_odom_publisher.py",
-])
+], env=odom_env)
 
 # Lidar leader-body filter: subscribes /follower/scan_raw (from gz bridge),
 # strips beams that hit the leader's mesh, republishes /follower/scan.
@@ -170,7 +175,14 @@ time.sleep(2)  # let the tracker register before the BT subscribes
 fenv = dict(os.environ)
 fenv["PYTHONPATH"] = (
     "/opt/follow_everything_nav2:" + fenv.get("PYTHONPATH", "")).rstrip(":")
-fenv.setdefault("SIM_MAP", "/dev/null")  # forces 15x15 fallback
+# BT reads SIM_MAP for its world dimensions (W*0.5, H*0.5). Empty has no
+# map file → /dev/null forces the BT's 15×15 fallback. Non-empty maps must
+# pass the actual file so the BT's planning grid covers the whole world
+# (otherwise the bot, spawned per the F cell, lives outside A*'s domain).
+if MAP == "empty":
+    fenv.setdefault("SIM_MAP", "/dev/null")
+else:
+    fenv["SIM_MAP"] = f"/opt/follow_everything_nav2/sim/maps/{MAP}.txt"
 spawn("follower", [
     "python3", "-u",
     "/opt/follow_everything_nav2/follower_pkg/python/follow_everything_follower.py",

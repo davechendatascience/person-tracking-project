@@ -294,7 +294,17 @@ Compose now mounts the parent repo's ML payloads read-only at the paths
 | `../DAM4SAM/`                          | `/opt/DAM4SAM`                  |
 | `../follow_everything/`                | `/opt/follow_everything`        |
 | `../sam2.1_hiera_large.pt`             | `/opt/sam2.1_hiera_large.pt`    |
+| `../sam2.1_hiera_small.pt`             | `/opt/sam2.1_hiera_small.pt`    |
 | `../yolo11m.pt`                        | `/opt/yolo11m.pt`               |
+
+The small SAM2.1 checkpoint is what `dam4sam_tracker.py` currently runs
+(sam21pp-S is faster on the GB10 with only a small accuracy hit). If
+`../sam2.1_hiera_small.pt` is missing on the host, fetch it once with:
+
+```bash
+curl -fL -o ../sam2.1_hiera_small.pt \
+  https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt
+```
 
 (Mounted under `/opt/` rather than `/ws/` so Docker's bind-mount auto-creation
 doesn't drop empty root-owned stubs into the host project directory.)
@@ -458,3 +468,51 @@ around its rectangular patrol, holding ~1.5 m stand-off.
 
 To regress: `detection_source:=oracle` on both launches and check the
 follower behaves identically (same topic contract, just different source).
+
+## Recording an evaluation episode
+
+[`eval/record_episode.py`](eval/record_episode.py) launches the full stack
+(gz Fortress + bridges, leader patrol, oracle/DAM4SAM tracker, BT follower,
+snapshot recorder) for a fixed duration and writes per-process logs +
+top-down snapshots into `results/logs/ep_<unix_ts>_<map>_0/`.
+
+```bash
+# inside the running sim container, from /ws:
+source /opt/ros/humble/setup.bash
+python3 eval/record_episode.py [duration_sec] [detection_source] [map]
+```
+
+| arg                | values                  | default  |
+|--------------------|-------------------------|----------|
+| `duration_sec`     | integer seconds         | `30`     |
+| `detection_source` | `oracle` \| `dam4sam`   | `oracle` |
+| `map`              | `empty` \| `cluttered`  | `empty`  |
+
+Examples:
+
+```bash
+# 90 s oracle run on the empty map
+python3 eval/record_episode.py 90 oracle empty
+
+# 90 s DAM4SAM (real perception) run on the cluttered map
+python3 eval/record_episode.py 90 dam4sam cluttered
+```
+
+Output layout:
+
+```
+results/logs/ep_<ts>_<map>_0/
+├── world.log        # gz + bridges + world_odom_publisher + lidar_leader_filter
+├── leader.log       # oracle_camera + leader_controller
+├── follower.log     # dam4sam_tracker + follow_everything_follower (BT)
+├── snapshots.log    # snapshot_recorder
+└── snapshots/       # one top-down PNG per second (pose, FOV, A* path, last_seen)
+```
+
+If invoked from outside the container, prefix with `docker exec`:
+
+```bash
+docker exec <follow_everything_nav2_3d-sim-run-...> bash -lc \
+  'source /opt/ros/humble/setup.bash && cd /ws && \
+   python3 eval/record_episode.py 90 dam4sam cluttered'
+```

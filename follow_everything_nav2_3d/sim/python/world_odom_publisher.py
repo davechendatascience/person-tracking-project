@@ -24,6 +24,7 @@ import math
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 
 from geometry_msgs.msg import Quaternion
 from nav_msgs.msg import Odometry
@@ -41,7 +42,18 @@ FOLLOWER_FRAME = "follower"
 # negative-y / negative-x the BT's lidar mapper dropped the hits and A*
 # refused goals there. Shift gz coords into the positive quadrant before
 # publishing /follower/odom so the BT's first-quadrant assumption holds.
-WORLD_ORIGIN_OFFSET = (7.5, 7.5)  # half of the 15×15 fallback world
+#
+# Empty world: gz spawns the bot at the world origin (0, 0), but the BT
+# wants positive coords (its A* grid is (0, W) × (0, H)). We shift by
+# (W/2, H/2) = (7.5, 7.5) so bot is at world (7.5, 7.5).
+#
+# Map-file worlds (cluttered/forest/...): build_world.py already places gz
+# origin at the map's bottom-left corner — gz coords are already in
+# (0, W) × (0, H). Adding +7.5 would put the bot way outside the BT's
+# planning grid. Use no offset instead.
+import os as _os
+_MAP = _os.environ.get("EP_MAP", "empty")
+WORLD_ORIGIN_OFFSET = (7.5, 7.5) if _MAP == "empty" else (0.0, 0.0)
 
 
 def yaw_from_quat(q: Quaternion) -> float:
@@ -52,7 +64,15 @@ def yaw_from_quat(q: Quaternion) -> float:
 
 class WorldOdomPublisher(Node):
     def __init__(self) -> None:
-        super().__init__("world_odom_publisher")
+        # use_sim_time=True so self.get_clock().now() returns gz sim time
+        # (the same clock camera/lidar message stamps are in). Without this
+        # we'd stamp /follower/odom with wall-clock and dam4sam_tracker's
+        # _pose_at(frame_ns) lookup would always reject due to clock skew.
+        # The TFMessage from /gz_pose_truth has zero per-transform stamps
+        # (gz bridge limitation), so we can't use the source stamp.
+        super().__init__(
+            "world_odom_publisher",
+            parameter_overrides=[Parameter("use_sim_time", value=True)])
         self._latest_pose = None  # (px, py, pz, qx, qy, qz, qw)
         self.create_subscription(
             TFMessage, "/gz_pose_truth", self._on_poses, 50)
@@ -60,7 +80,7 @@ class WorldOdomPublisher(Node):
         self.create_timer(1.0 / PUB_RATE_HZ, self._tick)
         self.get_logger().info(
             "world_odom_publisher live; mirroring gz_pose_truth follower "
-            "into /follower/odom (world frame)")
+            "into /follower/odom (world frame, sim_time stamps)")
 
     def _on_poses(self, msg: TFMessage) -> None:
         for tr in msg.transforms:

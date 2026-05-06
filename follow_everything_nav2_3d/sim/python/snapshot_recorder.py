@@ -54,7 +54,11 @@ CAM_RANGE_M = 6.0
 # (0..Wm, 0..Hm) world, gz lives in a centered world. Shift everything we
 # read directly from /gz_pose_truth so it overlays correctly on the BT's
 # OccupancyGrid (which is published at origin (0, 0)).
-WORLD_ORIGIN_OFFSET = (7.5, 7.5)
+# Mirror world_odom_publisher's per-map convention: empty needs +7.5 to
+# move the bot off gz's centered origin into the BT's first-quadrant grid;
+# map-file worlds already have gz origin at the bottom-left corner so no
+# offset is needed (otherwise the bot is drawn well outside the grid).
+WORLD_ORIGIN_OFFSET = (7.5, 7.5) if MAP_NAME == "empty" else (0.0, 0.0)
 
 
 def yaw_from_quat(q: Quaternion) -> float:

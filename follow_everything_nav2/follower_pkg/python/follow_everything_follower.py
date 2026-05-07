@@ -937,11 +937,21 @@ class SpiralExpand(_Leaf):
         self._target = None
         self._anchored_t = 0.0  # last_seen_t when this leaf last anchored
         self._reached_center = False
+        # Phase 1.5 (sweep rotation) state. Once we've reached the
+        # predicted center and still don't see the leader, rotate in place
+        # in the direction the leader exited until either we re-acquire or
+        # we've covered a full 2π. After that, fall through to phase 2's
+        # concentric-ring search.
+        self._sweep_dir = 0          # +1 CCW, -1 CW, 0 = not active / done
+        self._sweep_remaining_rad = 0.0
+        self._sweep_last_yaw = 0.0
 
     def update(self):
         if self.bb.leader_visible:
             self._reached_center = False
             self._anchored_t = 0.0
+            self._sweep_dir = 0
+            self._sweep_remaining_rad = 0.0
             return py_trees.common.Status.FAILURE
         if self.bb.last_seen is None:
             self.bb.cmd = (0.0, 0.4)
@@ -958,6 +968,8 @@ class SpiralExpand(_Leaf):
             self._reached_center = False
             self._anchored_t = self.bb.last_seen_t
             self.bb.spiral_radius = 0.0
+            self._sweep_dir = 0
+            self._sweep_remaining_rad = 0.0
             # Seed phase-2 angle to the leader's last-known travel
             # direction so the search begins where the leader exited,
             # not hardcoded east. Falls back to 0 if leader_vel is
@@ -976,6 +988,31 @@ class SpiralExpand(_Leaf):
             else:
                 v, w = goto_command(self.bb, (cx, cy), V_MAX_HARD)
                 self.bb.cmd = (v, w)
+                return py_trees.common.Status.RUNNING
+
+        # Phase 1.5: sweep-rotate at the center in the direction the
+        # leader exited, for up to 2π, before expanding into rings.
+        # Direction = sign of leader_vel's transverse component in body
+        # frame at the moment we lost the leader: if the leader was
+        # moving toward our body-left we keep rotating CCW to track it,
+        # otherwise CW.
+        if self._sweep_dir == 0:
+            yaw = self.bb.yaw
+            vx, vy = self.bb.leader_vel
+            transverse = -vx * math.sin(yaw) + vy * math.cos(yaw)
+            self._sweep_dir = 1 if transverse >= 0 else -1
+            self._sweep_remaining_rad = 2.0 * math.pi
+            self._sweep_last_yaw = yaw
+        if self._sweep_remaining_rad > 0:
+            dyaw = ((self.bb.yaw - self._sweep_last_yaw + math.pi)
+                    % (2.0 * math.pi) - math.pi)
+            # Only count yaw movement in our sweep direction.
+            if ((self._sweep_dir > 0 and dyaw > 0)
+                    or (self._sweep_dir < 0 and dyaw < 0)):
+                self._sweep_remaining_rad -= abs(dyaw)
+            self._sweep_last_yaw = self.bb.yaw
+            if self._sweep_remaining_rad > 0:
+                self.bb.cmd = (0.0, self._sweep_dir * 0.8)
                 return py_trees.common.Status.RUNNING
 
         # Phase 2: grow concentric rings around the spiral center.
@@ -1015,11 +1052,22 @@ class PlannedRecovery(_Leaf):
     This replaces the older ClearLOS/DriveToPrediction split: a single A*
     call captures both 'navigate around the blocker' and 'walk the clear
     line' in one mechanism, identical in spirit to the leader's planner."""
+    # Stuck detector: if we've barely moved (bbox under 5 cm) for 20+
+    # ticks (1 s at 20 Hz) while still claiming RUNNING, yield FAILURE so
+    # BackupRecovery / SpiralExpand can take a turn. Without this we'd
+    # sit forever rotating-only when apply_lidar_safety zeros v on every
+    # forward attempt and goto_command oscillates w trying to align with
+    # an unreachable last_seen.
+    STUCK_WINDOW_TICKS    = 20
+    STUCK_TRANSLATION_M   = 0.05
+
     def __init__(self, name, bb, plan_grid=None):
         super().__init__(name, bb)
         self._plan = []
         self._plan_t = 0.0
         self._target = None
+        from collections import deque
+        self._pose_window = deque(maxlen=self.STUCK_WINDOW_TICKS)
 
     def _approach_target(self, grid, target):
         """If `target` is in a blocked cell (LiDAR-mapped obstacle on top
@@ -1125,6 +1173,20 @@ class PlannedRecovery(_Leaf):
         # FIRST in the BT (higher priority); they only fall through to here
         # when their straight-line LOS check fails — i.e. visible-but-wall-
         # blocked. In that case we still want to A* toward the leader.
+        self._pose_window.append((self.bb.x, self.bb.y))
+        # Stuck-yield: if we've held RUNNING for ≥ STUCK_WINDOW_TICKS but
+        # the bot's pose bbox is < STUCK_TRANSLATION_M (rotating in place,
+        # apply_lidar_safety zeroing v on every forward try), drop to
+        # FAILURE so BackupRecovery / SpiralExpand can take over. Reset
+        # the window so we don't immediately re-yield on next entry.
+        if len(self._pose_window) >= self.STUCK_WINDOW_TICKS:
+            xs = [p[0] for p in self._pose_window]
+            ys = [p[1] for p in self._pose_window]
+            bbox = max(max(xs) - min(xs), max(ys) - min(ys))
+            if bbox < self.STUCK_TRANSLATION_M and not self.bb.leader_visible:
+                self._plan = []
+                self._pose_window.clear()
+                return py_trees.common.Status.FAILURE
         if self.bb.leader_visible and self.bb.leader_world is not None:
             target = self.bb.leader_world
         else:
@@ -1218,12 +1280,10 @@ class BackupRecovery(_Leaf):
         # Don't fire if leader is visible — Following/Chasing handle it.
         if self.bb.leader_visible:
             return py_trees.common.Status.FAILURE
-        # Don't fire if we've reached last_seen (let SpiralExpand search).
-        if self.bb.last_seen is not None:
-            d = math.hypot(self.bb.last_seen[0] - self.bb.x,
-                           self.bb.last_seen[1] - self.bb.y)
-            if d < self.AT_TARGET_DIST_M:
-                return py_trees.common.Status.FAILURE
+        # Stuck for 1 s (STUCK_WINDOW_TICKS) → fire. We used to gate this
+        # on "only if not at last_seen yet" but that left the bot wedged
+        # within 0.8 m of a stale last_seen for 30+ s while SpiralExpand
+        # also failed to make progress.
         # Need a full window to assess stuckness.
         if len(self._pose_window) < self.STUCK_WINDOW_TICKS:
             return py_trees.common.Status.FAILURE
@@ -1450,6 +1510,21 @@ class FollowEverythingNode(Node):
         self._tick_count = getattr(self, "_tick_count", 0) + 1
         if self._tick_count <= 3 or self._tick_count % 40 == 0:
             print(f"[FOLLOWER] _tick fired #{self._tick_count}", flush=True)
+        # TTL on last_seen: if we've been lost for 5 s and still haven't
+        # arrived (within 0.6 m), drop last_seen entirely. The leader has
+        # almost certainly moved past wherever we last detected it, and
+        # PlannedRecovery's repeated A* attempts to a stale target were
+        # leaving the bot wedged. With last_seen=None, SpiralExpand falls
+        # back to its "rotate slowly and look around" branch.
+        if (not self.bb.leader_visible
+                and self.bb.last_seen is not None
+                and self.bb.last_seen_t > 0
+                and time.time() - self.bb.last_seen_t > 5.0):
+            d = math.hypot(self.bb.last_seen[0] - self.bb.x,
+                           self.bb.last_seen[1] - self.bb.y)
+            if d > 0.6:
+                self.bb.last_seen = None
+                self.bb.last_seen_t = 0.0
         self.bb.cmd = (0.0, 0.0)
         try:
             self.tree.tick()

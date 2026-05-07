@@ -68,12 +68,10 @@ for _p in ("/ws", "/opt", "/opt/DAM4SAM"):
 # ---------------------------------------------------------------------------
 SAM2_CFG = {
     # DAM4SAM ships its own sam21pp_*.yaml configs alongside /opt/DAM4SAM/sam2/.
-    # We use the large (L) variant for tracking robustness in cluttered
-    # scenes. The small backbone tracked the leader fine in open spaces but
-    # drifted onto wall obstacles when the leader passed behind one — its
-    # appearance head couldn't tell a person from a similarly-coloured 1×1.5m
-    # box at close range. L runs ~2.5 Hz vs S's ~7-8 Hz; we accept the
-    # higher per-frame lag in exchange for far fewer drift events.
+    # Large (L) variant: ~857 MB checkpoint. Slower (~3 Hz) but the
+    # appearance head is the only one robust enough on our low-poly actor
+    # against similar-coloured 1.5 m brown box obstacles. Tiny was too
+    # eager to drift onto walls.
     "model_cfg":  "sam21pp_hiera_l.yaml",
     "checkpoint": "/opt/sam2.1_hiera_large.pt",
     "device":     "cuda",
@@ -720,8 +718,12 @@ class Dam4SamTracker(Node):
         from sam2.build_sam import build_sam2_video_predictor
 
         device = SAM2_CFG["device"] if torch.cuda.is_available() else "cpu"
+        import os
+        ckpt = SAM2_CFG["checkpoint"]
+        ckpt_size_mb = os.path.getsize(ckpt) / (1024 * 1024) if os.path.exists(ckpt) else -1
         log.info(
             f"DAM4SAM (full tracker, with DRM) device={device}, "
+            f"cfg={SAM2_CFG['model_cfg']} ckpt={ckpt} ({ckpt_size_mb:.0f} MB), "
             f"building predictor (slow first time)...")
 
         class _LocalDAM4SAMTracker(DAM4SAMTracker):
@@ -985,35 +987,20 @@ class Dam4SamTracker(Node):
         rng_lidar, lidar_idx = self._lidar_range_with_idx(scan, bearing)
         rng_depth = self._depth_range_in_mask(mask, depth, u_pix, cx, fx)
 
-        # When a mask exists, prefer depth-in-mask: the median Z across the
-        # whole mask measures the depth of the *masked object* — i.e., the
-        # leader, not whatever lidar happens to hit first along the camera
-        # ray. Lidar-primary failed in cluttered scenes when a wall sat
-        # between the bot and a partially-occluded leader: lidar returned
-        # the wall (~0.8 m), depth-in-mask returned the leader (~1.5 m),
-        # the 1.0 m cross-check passed (diff 0.7 m), and last_seen got
-        # pinned on the wall — the BT then "Followed" the static obstacle
-        # while the actual leader walked away.
-        if rng_depth is not None and rng_lidar is not None:
-            if rng_depth + 0.5 < rng_lidar:
-                # Depth says the masked object is *closer* than lidar's first
-                # hit. Sensor disagreement we can't reconcile (lidar should
-                # always see something at least as close as depth). Drop.
-                self._proj_disagree += 1
-                self._log_centroid_lidar(
-                    "DROP-depth<lidar", uv, bearing, lidar_idx,
-                    rng_lidar, rng_depth)
-                return None
+        # Always trust depth-in-mask when available. Don't cross-check
+        # against lidar: lidar_leader_filter intentionally replaces beams
+        # that hit the leader with infinity, so at the leader's bearing
+        # rng_lidar is *expected* to be much longer than rng_depth (it
+        # sees whatever's behind the leader, not the leader itself).
+        # The previous "drop if rng_depth + 0.5 < rng_lidar" gate killed
+        # most close-range detections — when the leader exited frame on
+        # one side, the BT's leader_world stayed pinned to the last
+        # un-dropped reading and the bot didn't rotate to follow.
+        if rng_depth is not None:
             self._proj_both_agree += 1
-            rng = rng_depth  # trust the in-mask measurement
-            tag = "agree" if abs(rng_lidar - rng_depth) <= 1.0 else "depth-occlusion"
-            self._log_centroid_lidar(
-                tag, uv, bearing, lidar_idx, rng_lidar, rng_depth)
-        elif rng_depth is not None:
-            self._proj_depth_only += 1
             rng = rng_depth
             self._log_centroid_lidar(
-                "depth-only", uv, bearing, lidar_idx, None, rng_depth)
+                "depth", uv, bearing, lidar_idx, rng_lidar, rng_depth)
         elif rng_lidar is not None:
             self._proj_lidar_only += 1
             rng = rng_lidar

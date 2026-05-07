@@ -40,6 +40,11 @@ services:
       #   curl -fL -o ../sam2.1_hiera_small.pt \
       #     https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt
       - ../sam2.1_hiera_small.pt:/opt/sam2.1_hiera_small.pt:ro
+      # Tiny backbone (sam21pp-T) — fastest, what dam4sam_tracker.py
+      # currently defaults to. Download once to the parent project root:
+      #   curl -fL -o ../sam2.1_hiera_tiny.pt \
+      #     https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt
+      - ../sam2.1_hiera_tiny.pt:/opt/sam2.1_hiera_tiny.pt:ro
       - ../yolo11m.pt:/opt/yolo11m.pt:ro
     working_dir: /ws
     stdin_open: true

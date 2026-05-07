@@ -81,13 +81,21 @@
              out 4 cm beneath the body's bottom face. -->
         <pose>0 0 0.10 0 0 0</pose>
         <inertial>
-          <!-- Solid cylinder, m=6 kg, r=0.20 m, h=0.10 m:
-               ixx=iyy=m(3r²+h²)/12 ≈ 0.065 ; izz=mr²/2=0.12.
-               (Earlier ixx,iyy=0.045 violated ixx+iyy ≥ izz, which gz
-               rejects with "invalid inertia".) -->
-          <mass>6.0</mass>
+          <!-- Heavy ballast (25 kg) with the COM pinned at the BOTTOM of
+               the chassis (link-relative z=-0.04 → world z=0.06, almost
+               at the wheel contact line). Combined with the wide 0.5 m
+               wheel track, this gives a tipping moment large enough
+               that bumps just push the bot sideways instead of rocking
+               it onto one wheel — even though the visual mast extends
+               1.6 m up, no physical mass lives up there.
+
+               For a uniform-density cylinder of m=25 kg, r=0.20 m,
+               h=0.10 m: ixx=iyy=m(3r²+h²)/12 ≈ 0.27 ; izz=mr²/2=0.50.
+               Triangle inequality (ixx+iyy ≥ izz) holds (0.54 ≥ 0.50). -->
+          <pose>0 0 -0.04 0 0 0</pose>
+          <mass>25.0</mass>
           <inertia>
-            <ixx>0.065</ixx><iyy>0.065</iyy><izz>0.12</izz>
+            <ixx>0.27</ixx><iyy>0.27</iyy><izz>0.50</izz>
             <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
           </inertia>
         </inertial>
@@ -113,13 +121,13 @@
           <material><diffuse>0 0 0 1</diffuse></material>
         </visual>
 
-        <!-- Mast (visual only, no collision) carrying the RGBD camera up to
-             head-height of the leader (~1.55 m). Eye-level perspective so
-             SAM2 sees the leader against the sky / ceiling instead of the
-             same low cone where the brown 1.5 m obstacles fill the frame. -->
+        <!-- Mast (visual only, no collision) carrying the RGBD camera at
+             ~1.30 m world height — below the 1.5 m walls so the bot can't
+             see over them. Mast is 1.20 m long, centered at chassis-frame
+             z=0.60 so it spans z=0 → z=1.20 (just up to camera mount). -->
         <visual name="mast_visual">
-          <pose>0 0 0.75 0 0 0</pose>
-          <geometry><cylinder><radius>0.04</radius><length>1.50</length></cylinder></geometry>
+          <pose>0 0 0.60 0 0 0</pose>
+          <geometry><cylinder><radius>0.04</radius><length>1.20</length></cylinder></geometry>
           <material>
             <ambient>0.20 0.20 0.20 1</ambient>
             <diffuse>0.20 0.20 0.20 1</diffuse>
@@ -182,14 +190,16 @@
           </lidar>
         </sensor>
 
-        <!-- Forward-facing RGB-D camera, mounted at the top of the mast at
-             world z ≈ 1.55 m (chassis link is at world z=0.10, so chassis-
-             frame z=1.45). Eye-level with the leader's head, looking
-             slightly forward (x=0.10). The dam4sam_tracker constants
-             CAM_OFFSET_X_BODY / CAM_OFFSET_Z_BODY in the perception code
-             must match this if the projection is to be correct. -->
+        <!-- Forward-facing RGB-D camera, mounted on the mast at world
+             z ≈ 1.30 m (chassis link is at world z=0.10, so chassis-frame
+             z=1.20). Below the 1.5 m wall/obstacle height so the bot
+             can't peek over them — earlier mounted at z=1.55 m, just
+             above wall tops, which let SAM2 sometimes lock onto the
+             leader through what should have been an opaque obstacle.
+             Roughly chest-height of the 1.7 m leader. The dam4sam_tracker
+             CAM_OFFSET_X_BODY / CAM_OFFSET_Z_BODY constants must match. -->
         <sensor name="rgbd_camera" type="rgbd_camera">
-          <pose>0.10 0 1.45 0 0 0</pose>
+          <pose>0.10 0 1.20 0 0 0</pose>
           <topic>/follower/camera</topic>
           <update_rate>20</update_rate>
           <always_on>1</always_on>

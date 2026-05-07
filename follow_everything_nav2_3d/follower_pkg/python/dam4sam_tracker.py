@@ -92,8 +92,10 @@ PERSON_CLS   = 0  # COCO
 # hardcoded optical→base_link transform: the gz bridge does NOT publish
 # follower/camera_optical_frame in /tf, so TF lookup fails. Same trick
 # the oracle uses — bypass TF, rely on URDF-fixed offsets.
-CAM_OFFSET_X_BODY = 0.23
-CAM_OFFSET_Z_BODY = 0.15
+CAM_OFFSET_X_BODY = 0.10
+CAM_OFFSET_Z_BODY = 1.30  # camera on mast at chassis z=1.20 + chassis link z=0.10
+                          # below the 1.5 m obstacle height so the bot
+                          # can't peek over walls
 
 # Hard cap on total frames the worker will process before exiting. At
 # ~5 Hz that's ~5.5 hours; plenty for a long demo.

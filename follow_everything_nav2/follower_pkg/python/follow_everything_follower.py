@@ -323,6 +323,11 @@ class Blackboard:
         self.leader_world = None
         self.last_seen = None
         self.last_seen_t = 0.0
+        # Body-frame bearing (rad) of the leader at the time of the most
+        # recent detection. + means body-left (image-left), − means
+        # body-right. Used by SpiralExpand phase-1.5 to choose which way
+        # to sweep when the leader has just exited the FOV.
+        self.last_bearing_body = None
         self._last_obs = None
         self.leader_vel = (0.0, 0.0)
         self.miss_count = 0
@@ -376,6 +381,13 @@ class Blackboard:
         self.miss_count = 0
         self.last_seen = (out_wx, out_wy)
         self.last_seen_t = now
+        # Snapshot the body-frame bearing of the leader so SpiralExpand
+        # can sweep toward the side of the FOV the leader was last on.
+        # Uses raw (frame-time) wx,wy and the bot's current yaw — close
+        # enough since update_leader_from_world fires on each detection.
+        bearing_world = math.atan2(wy - self.y, wx - self.x)
+        self.last_bearing_body = (
+            (bearing_world - self.yaw + math.pi) % (2 * math.pi) - math.pi)
         # Re-detection: reset spiral search.
         self.spiral_radius = 0.0
         self.spiral_angle = 0.0
@@ -922,6 +934,85 @@ class DriveToPrediction(_Leaf):
         return py_trees.common.Status.RUNNING
 
 
+class SweepRecover(_Leaf):
+    """First-line lost-leader recovery: rotate in place at max yaw rate
+    for one full 2π. Sits BEFORE PlannedRecovery in the BT so we try the
+    cheap visual reacquire (a 4 s spin in place) before committing to a
+    multi-second A* drive to a possibly-stale last_seen.
+
+    Direction is chosen from last_bearing_body if available (positive
+    bearing = leader was on body-left = sweep CCW), else from leader_vel
+    transverse, else CCW. A wrong-direction guess takes at most 4 s
+    (full 360° at 1.5 rad/s); a right one finds the leader in <2 s.
+
+    State is persistent across ticks and is NOT interrupted by the
+    last_seen TTL — once a sweep starts it runs the whole 2π unless the
+    leader becomes visible. Returns FAILURE after one full cycle so the
+    BT falls through to PlannedRecovery (drive to last_seen) and below.
+    """
+    SWEEP_W           = 1.5
+    BUDGET_RAD        = 2.0 * math.pi
+    BUDGET_S          = 5.0   # wall-clock timeout in case yaw doesn't progress
+    COOLDOWN_TICKS    = 30    # don't immediately re-fire after a full cycle
+
+    def __init__(self, name, bb):
+        super().__init__(name, bb)
+        self._dir = 0
+        self._remaining = 0.0
+        self._last_yaw = 0.0
+        self._start_t = 0.0
+        self._cooldown = 0
+
+    def _abandon(self):
+        self._dir = 0
+        self._remaining = 0.0
+        self._cooldown = self.COOLDOWN_TICKS
+
+    def update(self):
+        # Reset state when leader becomes visible — fresh sweep on next loss.
+        if self.bb.leader_visible:
+            self._abandon()
+            self._cooldown = 0
+            return py_trees.common.Status.FAILURE
+        # Cool-down: after we exhaust a sweep we wait COOLDOWN_TICKS before
+        # the BT re-arms us, otherwise we'd thrash with PlannedRecovery on
+        # every leader_visible flicker.
+        if self._cooldown > 0:
+            self._cooldown -= 1
+            return py_trees.common.Status.FAILURE
+        # Just lost the leader → arm a new sweep.
+        if self._dir == 0:
+            yaw = self.bb.yaw
+            if self.bb.last_bearing_body is not None:
+                self._dir = 1 if self.bb.last_bearing_body >= 0 else -1
+            else:
+                vx, vy = self.bb.leader_vel
+                transverse = -vx * math.sin(yaw) + vy * math.cos(yaw)
+                self._dir = 1 if transverse >= 0 else -1
+            self._remaining = self.BUDGET_RAD
+            self._last_yaw = yaw
+            self._start_t = time.time()
+        # Wall-clock fallback: if yaw simply isn't advancing (chassis
+        # wedged against a wall, VelocityControl outvoted by contact
+        # forces) we'd loop forever. After BUDGET_S seconds we give up
+        # this sweep regardless of yaw progress and let PlannedRecovery /
+        # BackupRecovery have a turn.
+        if time.time() - self._start_t > self.BUDGET_S:
+            self._abandon()
+            return py_trees.common.Status.FAILURE
+        # Track yaw progress in chosen direction.
+        dyaw = ((self.bb.yaw - self._last_yaw + math.pi)
+                % (2.0 * math.pi) - math.pi)
+        if (self._dir > 0 and dyaw > 0) or (self._dir < 0 and dyaw < 0):
+            self._remaining -= abs(dyaw)
+        self._last_yaw = self.bb.yaw
+        if self._remaining <= 0:
+            self._abandon()
+            return py_trees.common.Status.FAILURE
+        self.bb.cmd = (0.0, self._dir * self.SWEEP_W)
+        return py_trees.common.Status.RUNNING
+
+
 class SpiralExpand(_Leaf):
     """Two-phase recovery when PlannedRecovery couldn't find a path.
       Phase 1: drive STRAIGHT to the predicted-leader position (the
@@ -997,10 +1088,20 @@ class SpiralExpand(_Leaf):
         # moving toward our body-left we keep rotating CCW to track it,
         # otherwise CW.
         if self._sweep_dir == 0:
+            # Prefer the SIDE OF THE IMAGE the leader was last seen on:
+            # if the last detection's body bearing was positive (body-left,
+            # image-left of cx), the leader exited toward image-left, so
+            # we sweep CCW. Negative → CW. Falls back to leader_vel's
+            # transverse component if we never recorded a bearing (only
+            # body-frame oracle detections come without that field's
+            # update path firing).
             yaw = self.bb.yaw
-            vx, vy = self.bb.leader_vel
-            transverse = -vx * math.sin(yaw) + vy * math.cos(yaw)
-            self._sweep_dir = 1 if transverse >= 0 else -1
+            if self.bb.last_bearing_body is not None:
+                self._sweep_dir = 1 if self.bb.last_bearing_body >= 0 else -1
+            else:
+                vx, vy = self.bb.leader_vel
+                transverse = -vx * math.sin(yaw) + vy * math.cos(yaw)
+                self._sweep_dir = 1 if transverse >= 0 else -1
             self._sweep_remaining_rad = 2.0 * math.pi
             self._sweep_last_yaw = yaw
         if self._sweep_remaining_rad > 0:
@@ -1012,7 +1113,10 @@ class SpiralExpand(_Leaf):
                 self._sweep_remaining_rad -= abs(dyaw)
             self._sweep_last_yaw = self.bb.yaw
             if self._sweep_remaining_rad > 0:
-                self.bb.cmd = (0.0, self._sweep_dir * 0.8)
+                # Bumped from 0.8 → 1.5 rad/s (the chassis's MAX_W). Full
+                # sweep covers 360° in ~4 s instead of ~8 s, so when the
+                # leader has walked behind us we re-acquire faster.
+                self.bb.cmd = (0.0, self._sweep_dir * 1.5)
                 return py_trees.common.Status.RUNNING
 
         # Phase 2: grow concentric rings around the spiral center.
@@ -1202,7 +1306,11 @@ class PlannedRecovery(_Leaf):
         if not self.bb.leader_visible:
             d_to_target = math.hypot(target[0] - self.bb.x,
                                       target[1] - self.bb.y)
-            if d_to_target < 0.6:
+            # Was 0.6 m. Increased so the leaf yields earlier when the bot
+            # is "approximately at" last_seen — otherwise it keeps inching
+            # forward while SpiralExpand never gets to scan, and the
+            # leader walks across the map during the inching.
+            if d_to_target < 1.2:
                 return py_trees.common.Status.FAILURE
         # Pop reached waypoints
         while self._plan and math.hypot(self._plan[0][0] - self.bb.x,
@@ -1322,6 +1430,12 @@ def build_tree(bb: Blackboard, plan_grid) -> py_trees.trees.BehaviourTree:
         Retreating("Retreating", bb),
         Following("Following", bb),
         Chasing("Chasing", bb),
+        # SweepRecover before PlannedRecovery: when we just lose the leader,
+        # try a 360° spin-in-place (cheap, ~4 s at 1.5 rad/s) BEFORE we
+        # commit to driving to last_seen (expensive, multi-second). With
+        # dam4sam's noisy last_seen the visual reacquire wins most of the
+        # time; A* to last_seen is the fallback after the spin completes.
+        SweepRecover("SweepRecover", bb),
         PlannedRecovery("PlannedRecovery", bb, plan_grid),
         BackupRecovery("BackupRecovery", bb),
         SpiralExpand("SpiralExpand", bb, plan_grid),

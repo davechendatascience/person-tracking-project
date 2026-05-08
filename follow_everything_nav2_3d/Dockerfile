@@ -60,9 +60,11 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu12
         torch==2.5.1 torchvision==0.20.1 \
  || pip install --no-cache-dir torch torchvision  # CPU fallback if cu126 wheel unavailable
 
-# DAM4SAM / SAM2 runtime deps (the existing follow_everything/perception/
-# sam2_tracker.py imports these). hydra-core + iopath come from sam2's setup,
-# ultralytics provides YOLO bootstrap for the first-frame leader bbox.
+# EdgeTAM / SAM2 runtime deps. hydra-core + iopath are SAM2's loader
+# dependencies; timm is needed by EdgeTAM's RepViT backbone; ultralytics
+# provides YOLO for the first-frame bootstrap. (vot-toolkit / vot-trax
+# were DAM4SAM-specific and are no longer needed since we stripped the
+# DAM4SAM dependency.)
 RUN pip install --no-cache-dir \
         "numpy<2" \
         opencv-python-headless \
@@ -71,21 +73,21 @@ RUN pip install --no-cache-dir \
         iopath \
         einops \
         ultralytics \
+        timm \
         tqdm \
         scipy \
-        py_trees \
-        vot-toolkit==0.7.1 \
-        vot-trax==4.0.2
+        py_trees
 
 WORKDIR /ws
 # PYTHONPATH:
 #   /opt              parent of `follow_everything/` and `follow_everything_nav2/`
 #                     so `from follow_everything.perception import …` resolves.
-#   /opt/DAM4SAM      so `import sam2` (DAM4SAM's modified copy) resolves.
+#   /opt/EdgeTAM      so `import sam2` resolves to EdgeTAM's `sam2` fork
+#                     (we use it via build_sam2_video_predictor).
 #   /opt/follow_everything_nav2
 #                     so `from sim.world import ROBOT_RADIUS` resolves
 #                     (the 2D project's BT follower expects `sim` as a
 #                     top-level package — its sim/ folder lives at
 #                     /opt/follow_everything_nav2/sim/).
 ENV WS_ROOT=/ws \
-    PYTHONPATH=/ws:/opt:/opt/DAM4SAM:/opt/follow_everything_nav2:${PYTHONPATH}
+    PYTHONPATH=/ws:/opt:/opt/EdgeTAM:/opt/follow_everything_nav2:${PYTHONPATH}

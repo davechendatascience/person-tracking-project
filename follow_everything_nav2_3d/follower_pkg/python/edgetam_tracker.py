@@ -1,27 +1,23 @@
-"""DAM4SAM tracker bridge.
+"""EdgeTAM streaming tracker bridge.
 
-Online streaming wrapper around the *full* DAM4SAM tracker (with DRM —
-Distractor Rejection Module — and proper temporal smoothing). The earlier
-version of this file ran a bespoke per-frame `_run_single_frame_inference`
-loop with no DRM; on a low-poly Gazebo actor the mask collapsed within
-~30 frames and never recovered. Replaced with `DAM4SAMTracker` from
-/opt/DAM4SAM, which manages its own inference state, DRM bookkeeping,
-and mask propagation.
+Online streaming wrapper around EdgeTAM (facebookresearch/EdgeTAM), a
+SAM2-compatible video predictor optimised for edge devices. Replaces
+the earlier DAM4SAM-based bridge — DAM4SAM's DRM didn't help on our
+low-poly actor, and EdgeTAM's lighter backbone tracks at ~20 Hz vs
+DAM4SAM's ~3 Hz.
 
-The tracker is slow (sam2.1_hiera_large ≈ 5–8 Hz on a GB10), the camera
-is fast (20 Hz). Coupling them naïvely backs up frames, so:
+EdgeTAM ships a fork of SAM2's `sam2` package; we drive it through the
+streaming pattern (manual inference_state dict, propagate_in_video with
+max_frame_num_to_track=0) inlined in _build_edgetam_streaming_tracker.
 
-    - Lidar + oracle keep ticking at 20 Hz, untouched.
-    - The detection topic /follower/camera/detections_dam4sam ticks at
-      DAM4SAM's actual rate — we publish exactly when DAM4SAM yields a
-      result.
-    - On every track() call we snapshot the *latest* camera RGB at that
-      moment. Frames that arrived while the tracker was busy are simply
-      dropped. The tracker itself sees a contiguous frame index sequence.
+The camera is 20 Hz; we publish on /follower/camera/detections_dam4sam
+(name kept for backwards compat with record_episode.py) at the
+tracker's actual rate. On every track() call we snapshot the *latest*
+camera RGB; frames that arrived while the tracker was busy are dropped.
 
-Bootstrap: YOLO11 finds the highest-confidence 'person' box on the first
-incoming RGB frame; that box becomes the DAM4SAM init prompt. Until then
-the node publishes empty Detection2DArrays.
+Bootstrap: oracle leader pose builds a depth-filtered init mask on the
+first incoming RGB frame; that mask becomes the EdgeTAM init prompt.
+Until then the node publishes empty Detection2DArrays.
 """
 import os
 # Must be set before torch is imported anywhere. Tells the CUDA caching
@@ -56,24 +52,25 @@ from vision_msgs.msg import (
 
 
 # ---------------------------------------------------------------------------
-# sys.path injection so the follow_everything + DAM4SAM checkouts mounted
-# at /opt/* (see docker-compose.yml) are importable. /opt is the parent of
-# the `follow_everything` package; /opt/DAM4SAM goes on the path directly
-# because we import its `sam2` subdir as a top-level module.
-for _p in ("/ws", "/opt", "/opt/DAM4SAM"):
+# sys.path injection so the follow_everything + EdgeTAM checkouts mounted
+# at /opt/* (see docker-compose.yml) are importable. /opt/EdgeTAM goes on
+# the path directly because we import its `sam2` subdir as a top-level
+# module via build_sam2_video_predictor.
+for _p in ("/ws", "/opt", "/opt/EdgeTAM"):
     if _p not in sys.path and Path(_p).is_dir():
         sys.path.insert(0, _p)
 
 
 # ---------------------------------------------------------------------------
 SAM2_CFG = {
-    # DAM4SAM ships its own sam21pp_*.yaml configs alongside /opt/DAM4SAM/sam2/.
-    # Large (L) variant: ~857 MB checkpoint. Slower (~3 Hz) but the
-    # appearance head is the only one robust enough on our low-poly actor
-    # against similar-coloured 1.5 m brown box obstacles. Tiny was too
-    # eager to drift onto walls.
-    "model_cfg":  "sam21pp_hiera_l.yaml",
-    "checkpoint": "/opt/sam2.1_hiera_large.pt",
+    # EdgeTAM (facebookresearch/EdgeTAM) — a SAM2-compatible fork
+    # optimised for edge devices. Mounted at /opt/EdgeTAM with its own
+    # `sam2` package and checkpoint. ~10× faster propagation than
+    # sam2_hiera_large; we replaced the DAM4SAM (DRM) wrapper with an
+    # inline streaming wrapper that drives EdgeTAM directly — no
+    # DAM4SAM dependency. See _build_edgetam_streaming_tracker.
+    "model_cfg":  "configs/edgetam.yaml",
+    "checkpoint": "/opt/EdgeTAM/checkpoints/edgetam.pt",
     "device":     "cuda",
     "image_size": 1024,
 }
@@ -574,7 +571,7 @@ class Dam4SamTracker(Node):
 
         log = self.get_logger()
         try:
-            tracker = self._build_dam4sam_tracker(log)
+            tracker = self._build_edgetam_streaming_tracker(log)
         except Exception as e:
             import traceback
             log.error(f"DAM4SAM build failed: {e!r}\n{traceback.format_exc()}")
@@ -591,14 +588,14 @@ class Dam4SamTracker(Node):
 
         init_pil = PILImage.fromarray(self._init_rgb)
         try:
-            # Prefer the depth-filtered oracle mask when available — it's
-            # already restricted to leader pixels, so SAM2 doesn't have to
-            # disambiguate from a wall-contaminated bbox.
-            init_mask = self._init_mask
-            init_bbox = (None if init_mask is not None
-                         else self._init_bbox.astype(np.float32).tolist())
+            # EdgeTAM tracks most reliably from a bbox prompt — its
+            # appearance head locks onto the dense bbox region rather
+            # than a sparse depth-filtered mask. We always pass the
+            # oracle bbox; the depth-filtered mask is dropped (the
+            # mask-based path was producing 0-px propagated masks).
+            init_bbox = self._init_bbox.astype(np.float32).tolist()
             out_dict = tracker.initialize(
-                init_pil, init_mask=init_mask, bbox=init_bbox)
+                init_pil, init_mask=None, bbox=init_bbox)
         except Exception as e:
             import traceback
             log.error(f"DAM4SAM initialize crashed: {e!r}\n{traceback.format_exc()}")
@@ -607,9 +604,28 @@ class Dam4SamTracker(Node):
         log.info(
             f"DAM4SAM init: mask shape={mask0.shape} px_on={int(mask0.sum())} "
             f"bbox={self._init_bbox.tolist()}")
+        # Debug-dump init RGB + bbox + predicted mask so we can see what
+        # EdgeTAM was shown when it failed to lock on. Saved to a stable
+        # path under the episode log dir if EP_LOG_DIR is set.
+        debug_dir = os.environ.get("EP_LOG_DIR")
+        if debug_dir:
+            try:
+                Path(debug_dir).mkdir(parents=True, exist_ok=True)
+                _x1, _y1, _w, _h = [int(v) for v in self._init_bbox.tolist()]
+                _x2, _y2 = _x1 + _w, _y1 + _h
+                rgb_with_box = self._init_rgb.copy()
+                cv2.rectangle(rgb_with_box, (_x1, _y1), (_x2, _y2),
+                              (0, 255, 0), 2)
+                cv2.imwrite(f"{debug_dir}/edgetam_init_rgb.png",
+                            rgb_with_box[..., ::-1])
+                cv2.imwrite(f"{debug_dir}/edgetam_init_mask.png",
+                            (mask0 * 255).astype(np.uint8))
+            except Exception as e:
+                log.warn(f"debug init dump failed: {e!r}")
         self._push_result(0, self._make_result(mask0))
         vis_n = 1 if mask0.any() else 0
         inv_n = 0 if mask0.any() else 1
+        debug_frames_left = 8  # dump first 8 propagated frames
 
         # ---- Streaming loop: one track() per fresh ROS frame --------
         LOG_EVERY = 30
@@ -641,6 +657,22 @@ class Dam4SamTracker(Node):
                 else:
                     inv_n += 1
                 self._push_result(frame_idx, self._make_result(mask))
+                if debug_frames_left > 0 and debug_dir:
+                    try:
+                        overlay = rgb.copy()
+                        if mask.any():
+                            overlay[mask > 0] = (
+                                overlay[mask > 0] * 0.5
+                                + np.array([255, 80, 80]) * 0.5).astype(np.uint8)
+                        cv2.imwrite(
+                            f"{debug_dir}/edgetam_track_f{frame_idx:03d}.png",
+                            overlay[..., ::-1])
+                        cv2.imwrite(
+                            f"{debug_dir}/edgetam_track_f{frame_idx:03d}_mask.png",
+                            (mask * 255).astype(np.uint8))
+                    except Exception as e:
+                        log.warn(f"debug track dump failed: {e!r}")
+                    debug_frames_left -= 1
 
                 self._evict_dam4sam_state(
                     tracker, frame_idx, STATE_KEEP_BEHIND)
@@ -709,39 +741,171 @@ class Dam4SamTracker(Node):
     # ------------------------------------------------------------------
     # DAM4SAM helpers — kept as instance methods so they're easy to test.
     # ------------------------------------------------------------------
-    def _build_dam4sam_tracker(self, log):
-        """Instantiate the official DAM4SAMTracker, bypassing the parent's
-        `determine_tracker` lookup (which assumes the checkpoint lives at
-        /opt/DAM4SAM/checkpoints/sam2.1_hiera_large.pt — but our copy is
-        at /opt/sam2.1_hiera_large.pt and /opt/DAM4SAM is read-only)."""
+    def _build_edgetam_streaming_tracker(self, log):
+        """Build EdgeTAM's video predictor and wrap it in a streaming
+        tracker that exposes the same .initialize / .track API the rest
+        of this file expects, without depending on DAM4SAM or its DRM.
+
+        EdgeTAM is a drop-in SAM2 fork (same `sam2` package layout) but
+        with a smaller, faster model. SAM2's standard init_state(...)
+        only accepts MP4 / JPEG-folder paths; for streaming we build the
+        inference_state dict by hand (init_state_tw) and advance one
+        frame at a time via propagate_in_video(start, max=0). This is
+        the same pattern DAM4SAM uses internally — minus the DRM
+        (Distractor Rejection Module)."""
+        import os
+        from collections import OrderedDict
         import torch
-        sys.path.insert(0, "/opt/DAM4SAM")
-        from dam4sam_tracker import DAM4SAMTracker
+        import torch.nn.functional as F
+
+        # Insert EdgeTAM's repo on sys.path so `from sam2 ...` resolves
+        # to EdgeTAM's fork (it ships its own `sam2/` directory).
+        sys.path.insert(0, "/opt/EdgeTAM")
         from sam2.build_sam import build_sam2_video_predictor
 
-        device = SAM2_CFG["device"] if torch.cuda.is_available() else "cpu"
-        import os
+        device = (torch.device(SAM2_CFG["device"])
+                  if torch.cuda.is_available()
+                  else torch.device("cpu"))
         ckpt = SAM2_CFG["checkpoint"]
-        ckpt_size_mb = os.path.getsize(ckpt) / (1024 * 1024) if os.path.exists(ckpt) else -1
+        ckpt_size_mb = (os.path.getsize(ckpt) / (1024 * 1024)
+                        if os.path.exists(ckpt) else -1)
         log.info(
-            f"DAM4SAM (full tracker, with DRM) device={device}, "
+            f"EdgeTAM streaming tracker device={device}, "
             f"cfg={SAM2_CFG['model_cfg']} ckpt={ckpt} ({ckpt_size_mb:.0f} MB), "
             f"building predictor (slow first time)...")
 
-        class _LocalDAM4SAMTracker(DAM4SAMTracker):
-            def __init__(self):
-                self.checkpoint = SAM2_CFG["checkpoint"]
-                self.model_cfg = SAM2_CFG["model_cfg"]
-                self.input_image_size = SAM2_CFG["image_size"]
-                self.img_mean = torch.tensor(
-                    [0.485, 0.456, 0.406], dtype=torch.float32)[:, None, None]
-                self.img_std = torch.tensor(
-                    [0.229, 0.224, 0.225], dtype=torch.float32)[:, None, None]
-                self.predictor = build_sam2_video_predictor(
-                    self.model_cfg, self.checkpoint, device=device)
-                self.tracking_times = []
+        input_size = SAM2_CFG["image_size"]
+        _t_build = time.time()
+        predictor = build_sam2_video_predictor(
+            SAM2_CFG["model_cfg"], ckpt, device=device)
+        log.info(
+            f"EdgeTAM predictor built in {time.time() - _t_build:.1f}s "
+            "(ready for first frame)")
+        img_mean = torch.tensor(
+            [0.485, 0.456, 0.406], dtype=torch.float32, device=device)[:, None, None]
+        img_std = torch.tensor(
+            [0.229, 0.224, 0.225], dtype=torch.float32, device=device)[:, None, None]
 
-        return _LocalDAM4SAMTracker()
+        class _EdgeTAMStreamingTracker:
+            """Minimal streaming wrapper around EdgeTAM's video predictor."""
+            def __init__(self):
+                self.predictor = predictor
+                self.input_image_size = input_size
+                self.img_mean = img_mean
+                self.img_std = img_std
+                self.frame_index = 0
+                self.img_width = 0
+                self.img_height = 0
+                self.inference_state = None
+
+            def _prepare_image(self, image_pil):
+                arr = np.array(image_pil)
+                t = torch.from_numpy(arr).to(device).permute(2, 0, 1).float() / 255.0
+                t = F.interpolate(
+                    t.unsqueeze(0),
+                    size=(self.input_image_size, self.input_image_size),
+                    mode="bilinear", align_corners=False).squeeze(0)
+                return (t - self.img_mean) / self.img_std
+
+            def _new_state(self):
+                """Manual inference_state dict — same keys SAM2 / EdgeTAM
+                touch internally, just no MP4/JPEG video loader."""
+                s = {}
+                s["images"] = {}
+                s["num_frames"] = 0
+                s["offload_video_to_cpu"] = False
+                s["offload_state_to_cpu"] = False
+                s["video_height"] = None
+                s["video_width"] = None
+                s["device"] = device
+                s["storage_device"] = device
+                s["point_inputs_per_obj"] = {}
+                s["mask_inputs_per_obj"] = {}
+                s["cached_features"] = {}
+                s["constants"] = {}
+                s["obj_id_to_idx"] = OrderedDict()
+                s["obj_idx_to_id"] = OrderedDict()
+                s["obj_ids"] = []
+                s["output_dict"] = {
+                    "cond_frame_outputs": {},
+                    "non_cond_frame_outputs": {},
+                }
+                s["output_dict_per_obj"] = {}
+                s["temp_output_dict_per_obj"] = {}
+                s["consolidated_frame_inds"] = {
+                    "cond_frame_outputs": set(),
+                    "non_cond_frame_outputs": set(),
+                }
+                s["tracking_has_started"] = False
+                s["frames_already_tracked"] = {}
+                s["frames_tracked_per_obj"] = {}
+                return s
+
+            @torch.inference_mode()
+            def initialize(self, image, init_mask=None, bbox=None):
+                """Seed the tracker on frame 0. Either init_mask
+                (HxW uint8) or bbox ([x, y, w, h]) must be provided."""
+                self.frame_index = 0
+                self.img_width = image.width
+                self.img_height = image.height
+                self.inference_state = self._new_state()
+                self.inference_state["video_height"] = image.height
+                self.inference_state["video_width"] = image.width
+                self.inference_state["images"][0] = self._prepare_image(image)
+                self.inference_state["num_frames"] = 1
+                self.predictor.reset_state(self.inference_state)
+                self.predictor._get_image_feature(
+                    self.inference_state, frame_idx=0, batch_size=1)
+                # EdgeTAM's appearance head locks more reliably on a
+                # dense bbox prompt than a sparse depth-filtered mask
+                # (a 32 × 93 person box at 5 m only had ~655 mask px,
+                # ~22% of the bbox area, which collapsed to 0 px after
+                # one propagation step). Prefer bbox when available and
+                # fall back to mask only if no bbox was supplied.
+                if bbox is not None:
+                    x, y, w, h = bbox  # xywh
+                    box = np.array([x, y, x + w, y + h], dtype=np.float32)
+                    _, _, out_logits = self.predictor.add_new_points_or_box(
+                        inference_state=self.inference_state,
+                        frame_idx=0, obj_id=0, box=box)
+                elif init_mask is not None:
+                    _, _, out_logits = self.predictor.add_new_mask(
+                        inference_state=self.inference_state,
+                        frame_idx=0, obj_id=0, mask=init_mask)
+                else:
+                    raise ValueError(
+                        "EdgeTAM init: neither bbox nor init_mask provided")
+                m = (out_logits[0, 0] > 0).float().cpu().numpy().astype(np.uint8)
+                # Drop the prepared image now that features are cached.
+                self.inference_state["images"].pop(0, None)
+                return {"pred_mask": m}
+
+            @torch.inference_mode()
+            def track(self, image, init=False):
+                """Advance one frame. EdgeTAM batches internally, so we
+                store the prepared image as 3D (C,H,W) — feeding 4D
+                turns the conv2d into a 5D crash."""
+                if not init:
+                    self.frame_index += 1
+                    self.inference_state["num_frames"] += 1
+                self.inference_state["images"][self.frame_index] = (
+                    self._prepare_image(image))
+                m = None
+                for out in self.predictor.propagate_in_video(
+                        self.inference_state,
+                        start_frame_idx=self.frame_index,
+                        max_frame_num_to_track=0):
+                    out_logits = out[2]
+                    m = (out_logits[0, 0] > 0).float().cpu().numpy().astype(np.uint8)
+                # Free the prepared image; cached features remain for
+                # the conditioning lookup, identical to DAM4SAM's flow.
+                self.inference_state["images"].pop(self.frame_index, None)
+                if m is None:
+                    m = np.zeros(
+                        (self.img_height, self.img_width), dtype=np.uint8)
+                return {"pred_mask": m}
+
+        return _EdgeTAMStreamingTracker()
 
     def _snapshot_latest_blocking(
         self,

@@ -112,8 +112,11 @@ spawn("world", [
 ])
 
 # ---------------------------------------------------------------------------
-# 2) LEADER: oracle_camera (its job is publishing the leader's body-frame
-#    detection — closest analog to the 2D project's leader process).
+# 2) LEADER: oracle_camera (publishes the leader's body-frame detection).
+#    We hold off on spawning leader_controller until the tracker has
+#    finished building its predictor + run its first init pass — otherwise
+#    the leader walks away during the ~30 s EdgeTAM build and the
+#    perception system races a moving target it hasn't locked onto yet.
 # ---------------------------------------------------------------------------
 oracle_cmd = ["python3", "-u", f"{WS}/sim/python/oracle_camera.py"]
 if SRC == "dam4sam":
@@ -122,13 +125,6 @@ if SRC == "dam4sam":
         "/follower/camera/detections:=/follower/camera/detections_oracle",
     ]
 spawn("leader", oracle_cmd)
-
-# Patrol controller for the leader model — drives /leader/cmd_vel.
-leader_env = dict(os.environ)
-leader_env["EP_MAP"] = MAP
-spawn("leader", [
-    "python3", "-u", f"{WS}/sim/python/leader_controller.py",
-], env=leader_env)
 
 # World-frame odom for the BT — replaces gz's local-frame odom.
 # EP_MAP gates WORLD_ORIGIN_OFFSET inside world_odom_publisher.py so the
@@ -162,15 +158,49 @@ procs.append(("snapshots", p))
 # ---------------------------------------------------------------------------
 # 3) FOLLOWER: DAM4SAM tracker + the BT-based follow_everything_follower.
 # ---------------------------------------------------------------------------
-tracker_cmd = ["python3", "-u", f"{WS}/follower_pkg/python/dam4sam_tracker.py"]
+tracker_cmd = ["python3", "-u", f"{WS}/follower_pkg/python/edgetam_tracker.py"]
 if SRC == "dam4sam":
+    # SRC name kept for backwards compat; the tracker is now EdgeTAM
+    # (DAM4SAM stripped). The remap takes the tracker output from
+    # /follower/camera/detections_dam4sam over to /follower/camera/detections.
     tracker_cmd += [
         "--ros-args", "-r",
         "/follower/camera/detections_dam4sam:=/follower/camera/detections",
     ]
-spawn("follower", tracker_cmd)
+# Forward the episode log directory so the tracker can dump init RGB +
+# the first few propagated frames for offline inspection.
+tracker_env = dict(os.environ)
+tracker_env["EP_LOG_DIR"] = str(DIR)
+spawn("follower", tracker_cmd, env=tracker_env)
 
-time.sleep(2)  # let the tracker register before the BT subscribes
+# Block until the tracker has both (a) finished building the predictor
+# (~30 s for EdgeTAM cold start) AND (b) run its first init pass on the
+# stationary leader. The init line only appears once the tracker has
+# received a camera frame + oracle bbox AND propagated them through its
+# first add_new_points_or_box call. While we wait the leader is still
+# (we haven't spawned leader_controller yet), so the bbox EdgeTAM sees
+# is from the spawn pose, not a moving target. No wall-clock fallback —
+# if the build doesn't finish there's no point continuing.
+INIT_READY_MARKER = "DAM4SAM init: mask shape="
+print(f"Waiting for tracker init ({INIT_READY_MARKER!r})...")
+_t0 = time.time()
+_follower_log = DIR / "follower.log"
+while True:
+    if _follower_log.exists():
+        with open(_follower_log) as _fh:
+            if INIT_READY_MARKER in _fh.read():
+                break
+    time.sleep(0.5)
+print(f"Tracker ready after {time.time() - _t0:.1f}s. "
+      "Spawning leader_controller + BT.")
+
+# Patrol controller for the leader — only spawn AFTER tracker init,
+# otherwise the leader walks away during the build window.
+leader_env = dict(os.environ)
+leader_env["EP_MAP"] = MAP
+spawn("leader", [
+    "python3", "-u", f"{WS}/sim/python/leader_controller.py",
+], env=leader_env)
 
 fenv = dict(os.environ)
 fenv["PYTHONPATH"] = (

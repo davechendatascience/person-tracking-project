@@ -66,7 +66,7 @@ class WorldOdomPublisher(Node):
     def __init__(self) -> None:
         # use_sim_time=True so self.get_clock().now() returns gz sim time
         # (the same clock camera/lidar message stamps are in). Without this
-        # we'd stamp /follower/odom with wall-clock and dam4sam_tracker's
+        # we'd stamp /follower/odom with wall-clock and edgetam_tracker's
         # _pose_at(frame_ns) lookup would always reject due to clock skew.
         # The TFMessage from /gz_pose_truth has zero per-transform stamps
         # (gz bridge limitation), so we can't use the source stamp.

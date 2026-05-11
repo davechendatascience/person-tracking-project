@@ -7,13 +7,13 @@ Usage (inside the container, from /ws):
     python3 eval/record_episode.py [duration_sec] [detection_source]
 
   duration_sec      defaults to 30
-  detection_source  defaults to oracle  (also accepts dam4sam)
+  detection_source  defaults to oracle  (also accepts edgetam)
 
 Produces:
     results/logs/ep_<unix_ts>_empty_0/
         world.log     # gz Fortress + ros_gz_bridges
         leader.log    # oracle_camera (knows the leader's true pose)
-        follower.log  # dam4sam_tracker + follow_everything_follower (BT)
+        follower.log  # edgetam_tracker + follow_everything_follower (BT)
 
 Bypasses `ros2 launch` so each conceptual subsystem gets its own log file.
 """
@@ -119,7 +119,7 @@ spawn("world", [
 #    perception system races a moving target it hasn't locked onto yet.
 # ---------------------------------------------------------------------------
 oracle_cmd = ["python3", "-u", f"{WS}/sim/python/oracle_camera.py"]
-if SRC == "dam4sam":
+if SRC == "edgetam":
     oracle_cmd += [
         "--ros-args", "-r",
         "/follower/camera/detections:=/follower/camera/detections_oracle",
@@ -156,16 +156,15 @@ p = subprocess.Popen(
 procs.append(("snapshots", p))
 
 # ---------------------------------------------------------------------------
-# 3) FOLLOWER: DAM4SAM tracker + the BT-based follow_everything_follower.
+# 3) FOLLOWER: EdgeTAM tracker + the BT-based follow_everything_follower.
 # ---------------------------------------------------------------------------
 tracker_cmd = ["python3", "-u", f"{WS}/follower_pkg/python/edgetam_tracker.py"]
-if SRC == "dam4sam":
-    # SRC name kept for backwards compat; the tracker is now EdgeTAM
-    # (DAM4SAM stripped). The remap takes the tracker output from
-    # /follower/camera/detections_dam4sam over to /follower/camera/detections.
+if SRC == "edgetam":
+    # Remap the tracker output from /follower/camera/detections_edgetam
+    # over to the contract topic /follower/camera/detections.
     tracker_cmd += [
         "--ros-args", "-r",
-        "/follower/camera/detections_dam4sam:=/follower/camera/detections",
+        "/follower/camera/detections_edgetam:=/follower/camera/detections",
     ]
 # Forward the episode log directory so the tracker can dump init RGB +
 # the first few propagated frames for offline inspection.
@@ -181,7 +180,7 @@ spawn("follower", tracker_cmd, env=tracker_env)
 # (we haven't spawned leader_controller yet), so the bbox EdgeTAM sees
 # is from the spawn pose, not a moving target. No wall-clock fallback —
 # if the build doesn't finish there's no point continuing.
-INIT_READY_MARKER = "DAM4SAM init: mask shape="
+INIT_READY_MARKER = "EdgeTAM init: mask shape="
 print(f"Waiting for tracker init ({INIT_READY_MARKER!r})...")
 _t0 = time.time()
 _follower_log = DIR / "follower.log"

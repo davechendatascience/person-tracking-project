@@ -10,10 +10,10 @@ EdgeTAM ships a fork of SAM2's `sam2` package; we drive it through the
 streaming pattern (manual inference_state dict, propagate_in_video with
 max_frame_num_to_track=0) inlined in _build_edgetam_streaming_tracker.
 
-The camera is 20 Hz; we publish on /follower/camera/detections_dam4sam
-(name kept for backwards compat with record_episode.py) at the
-tracker's actual rate. On every track() call we snapshot the *latest*
-camera RGB; frames that arrived while the tracker was busy are dropped.
+The camera is 20 Hz; we publish on /follower/camera/detections_edgetam
+at the tracker's actual rate. On every track() call we snapshot the
+*latest* camera RGB; frames that arrived while the tracker was busy
+are dropped.
 
 Bootstrap: oracle leader pose builds a depth-filtered init mask on the
 first incoming RGB frame; that mask becomes the EdgeTAM init prompt.
@@ -74,7 +74,7 @@ SAM2_CFG = {
     "device":     "cuda",
     "image_size": 1024,
 }
-# Heuristic gates for our TrackResult — DAM4SAM gives us the mask, we
+# Heuristic gates for our TrackResult — EdgeTAM gives us the mask, we
 # decide whether the mask is "real enough" to publish a body-frame xy.
 PERCEPTION_CFG = {
     "min_mask_area_ratio":  0.0005,
@@ -142,9 +142,9 @@ def _stamp_to_ns(t) -> int:
 
 
 # ---------------------------------------------------------------------------
-class Dam4SamTracker(Node):
+class EdgeTAMTracker(Node):
     def __init__(self) -> None:
-        super().__init__("dam4sam_tracker")
+        super().__init__("edgetam_tracker")
 
         # ---- Atomic snapshot of the latest ROS frame --------------------
         self._snap_lock = threading.Lock()
@@ -229,12 +229,12 @@ class Dam4SamTracker(Node):
         # world_odom_publisher.py (matches the frame the BT uses).
         self.create_subscription(Odometry, "/follower/odom", self._on_odom, 20)
         self.pub = self.create_publisher(
-            Detection2DArray, "/follower/camera/detections_dam4sam", 10)
+            Detection2DArray, "/follower/camera/detections_edgetam", 10)
         # Debug overlay — RGB frame SAM2 actually processed, with mask
         # tinted red, centroid drawn, and frame_idx in the corner. View in
         # RViz with fixed_frame=follower/camera_optical_frame.
         self.overlay_pub = self.create_publisher(
-            Image, "/follower/camera/dam4sam_overlay", 10)
+            Image, "/follower/camera/edgetam_overlay", 10)
 
         # 50 Hz drain — non-blocking. Whenever SAM2 has yielded, we publish.
         self.create_timer(0.02, self._publish_results)
@@ -243,7 +243,7 @@ class Dam4SamTracker(Node):
         self._worker.start()
 
         self.get_logger().info(
-            f"DAM4SAM tracker live. "
+            f"EdgeTAM tracker live. "
             f"awaiting first 'person' YOLO detection (conf ≥ {YOLO_CONF}); "
             f"detection topic ticks at the tracker's own rate "
             f"(slower than the camera).")
@@ -559,7 +559,7 @@ class Dam4SamTracker(Node):
             f"→ xywh={bbox_xywh.tolist()} (conf {conf[i]:.2f})")
 
     # ------------------------------------------------------------------
-    # Worker thread — full DAM4SAM tracker, one track() per ROS frame.
+    # Worker thread — full EdgeTAM tracker, one track() per ROS frame.
     # ------------------------------------------------------------------
     def _tracker_worker(self) -> None:
         # Wait for YOLO bootstrap.
@@ -574,7 +574,7 @@ class Dam4SamTracker(Node):
             tracker = self._build_edgetam_streaming_tracker(log)
         except Exception as e:
             import traceback
-            log.error(f"DAM4SAM build failed: {e!r}\n{traceback.format_exc()}")
+            log.error(f"EdgeTAM build failed: {e!r}\n{traceback.format_exc()}")
             return
 
         from PIL import Image as PILImage
@@ -598,11 +598,11 @@ class Dam4SamTracker(Node):
                 init_pil, init_mask=None, bbox=init_bbox)
         except Exception as e:
             import traceback
-            log.error(f"DAM4SAM initialize crashed: {e!r}\n{traceback.format_exc()}")
+            log.error(f"EdgeTAM initialize crashed: {e!r}\n{traceback.format_exc()}")
             return
         mask0 = out_dict["pred_mask"]
         log.info(
-            f"DAM4SAM init: mask shape={mask0.shape} px_on={int(mask0.sum())} "
+            f"EdgeTAM init: mask shape={mask0.shape} px_on={int(mask0.sum())} "
             f"bbox={self._init_bbox.tolist()}")
         # Debug-dump init RGB + bbox + predicted mask so we can see what
         # EdgeTAM was shown when it failed to lock on. Saved to a stable
@@ -629,14 +629,15 @@ class Dam4SamTracker(Node):
 
         # ---- Streaming loop: one track() per fresh ROS frame --------
         LOG_EVERY = 30
-        # DAM4SAMTracker stores every prepared image + per-frame predictor
-        # features in inference_state[...]. With sam2.1_hiera_l at 1024x1024
+        # EdgeTAM stores every prepared image + per-frame predictor
+        # features in inference_state[...]. With edgetam.pt at 1024x1024
         # that's ~3.5 GB / 30 frames if nothing is freed — we OOM in ~90 s.
         # Keep a rolling window of recent frames; drop the rest.
         STATE_KEEP_BEHIND = 16
         EMPTY_CACHE_EVERY = 30
-        # The conditioning frame (frame 0) MUST stay — DAM4SAM's DRM looks
-        # it up directly. Everything else past STATE_KEEP_BEHIND can go.
+        # The conditioning frame (frame 0) MUST stay — SAM2's propagation
+        # re-reads its cached features each step. Everything else past
+        # STATE_KEEP_BEHIND can go.
         frame_idx = 1
         try:
             while not self._stop.is_set() and frame_idx < MAX_FRAMES:
@@ -674,7 +675,7 @@ class Dam4SamTracker(Node):
                         log.warn(f"debug track dump failed: {e!r}")
                     debug_frames_left -= 1
 
-                self._evict_dam4sam_state(
+                self._evict_edgetam_state(
                     tracker, frame_idx, STATE_KEEP_BEHIND)
 
                 if frame_idx % EMPTY_CACHE_EVERY == 0:
@@ -686,7 +687,7 @@ class Dam4SamTracker(Node):
                         torch.cuda.memory_allocated() / 1e9
                         if torch.cuda.is_available() else 0.0)
                     log.info(
-                        f"dam4sam f={frame_idx} "
+                        f"edgetam f={frame_idx} "
                         f"vis={vis_n}/{vis_n+inv_n} "
                         f"last_mask_px={int(mask.sum())} "
                         f"cuda alloc={alloc_gb:.2f}GB")
@@ -696,12 +697,12 @@ class Dam4SamTracker(Node):
             import traceback
             log.error(f"tracker_worker crashed: {e!r}\n{traceback.format_exc()}")
 
-    def _evict_dam4sam_state(
+    def _evict_edgetam_state(
         self, tracker, frame_idx: int, keep_behind: int,
     ) -> None:
-        """Drop per-frame state in DAM4SAM's inference_state + predictor
+        """Drop per-frame state in EdgeTAM's inference_state + predictor
         caches for any frame older than (frame_idx - keep_behind), except
-        frame 0 (the DRM-anchored conditioning frame).
+        frame 0 (the conditioning frame).
 
         Called after every track() step to keep VRAM bounded."""
         cutoff = frame_idx - keep_behind
@@ -739,7 +740,7 @@ class Dam4SamTracker(Node):
                 del ft[k]
 
     # ------------------------------------------------------------------
-    # DAM4SAM helpers — kept as instance methods so they're easy to test.
+    # EdgeTAM helpers — kept as instance methods so they're easy to test.
     # ------------------------------------------------------------------
     def _build_edgetam_streaming_tracker(self, log):
         """Build EdgeTAM's video predictor and wrap it in a streaming
@@ -1082,7 +1083,7 @@ class Dam4SamTracker(Node):
 
     # ------------------------------------------------------------------
     def _publish_overlay(self, rgb: np.ndarray, result, frame_idx: int) -> None:
-        """RGB + tinted mask + centroid dot + status text → /follower/camera/dam4sam_overlay."""
+        """RGB + tinted mask + centroid dot + status text → /follower/camera/edgetam_overlay."""
         vis = rgb.copy()
         h, w = vis.shape[:2]
 
@@ -1130,14 +1131,14 @@ class Dam4SamTracker(Node):
         """Project mask centroid to body-frame (x, y), preferring lidar range
         at the bearing of the camera ray, with depth-inside-mask as fallback.
 
-        Why hybrid: depth at the centroid pixel is brittle — when DAM4SAM's
+        Why hybrid: depth at the centroid pixel is brittle — when EdgeTAM's
         mask is U-shaped or split, the centroid lands on background and the
         7×7-patch median picks up wall/floor depth (8–12 m) instead of the
         leader, projecting the leader to a phantom point 4–8 m past where
         they actually are. Lidar at the same bearing gives a single robust
         scalar; sampling depth across the *whole mask* (not at one pixel)
         also avoids that failure. Cross-check between the two catches the
-        residual case where DAM4SAM has drifted onto background.
+        residual case where EdgeTAM has drifted onto background.
         """
         h, w = depth.shape
         u_pix, v_pix = float(uv[0]), float(uv[1])
@@ -1270,7 +1271,7 @@ class Dam4SamTracker(Node):
 
 def main() -> None:
     rclpy.init()
-    node = Dam4SamTracker()
+    node = EdgeTAMTracker()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

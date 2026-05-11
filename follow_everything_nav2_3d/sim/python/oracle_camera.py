@@ -1,5 +1,5 @@
 """Oracle camera — geometric ground-truth detection that uses the SAME
-rendered camera as DAM4SAM, so the two are directly comparable.
+rendered camera as EdgeTAM, so the two are directly comparable.
 
 Pipeline:
   1. Follower pose from /gz_pose_truth (SceneBroadcaster -> bridge),
@@ -15,7 +15,7 @@ Pipeline:
      iff the projected pixel is inside the rendered image AND depth > 0.
   5. Emit body-frame (x, y) on /follower/camera/detections.
 
-Same intrinsics + same frustum as DAM4SAM, so they agree on what's "in
+Same intrinsics + same frustum as EdgeTAM, so they agree on what's "in
 view".
 """
 import math

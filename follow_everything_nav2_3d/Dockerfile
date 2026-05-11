@@ -50,7 +50,7 @@ RUN ign fuel download \
         -u "https://fuel.gazebosim.org/1.0/Mingfei/models/actor" \
         -v 4 || echo "[warn] Fuel pre-cache failed; will retry at runtime."
 
-# --- Phase 4b-i: ML stack for DAM4SAM ----------------------------------------
+# --- Phase 4b-i: ML stack for EdgeTAM / SAM2 ---------------------------------
 # Host is Grace Blackwell (sbsa aarch64) with CUDA 13.0 driver. CUDA 13 is
 # backward-compatible with cu12.x runtime, so we use the cu126 PyTorch wheels —
 # they have aarch64 binaries on download.pytorch.org and are stable. (No

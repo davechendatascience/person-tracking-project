@@ -1,4 +1,4 @@
-"""Follower-side launch: DAM4SAM tracker + BT-based follower.
+"""Follower-side launch: EdgeTAM tracker + BT-based follower.
 
 The follower is the BT-based `follow_everything_follower.py` from the 2D
 project at ../follow_everything_nav2/. Its topic contract (odom, scan,
@@ -8,9 +8,9 @@ add /opt/follow_everything_nav2 to PYTHONPATH (so its `from sim.world …`
 imports resolve), and just exec it.
 
 Toggle:
-  detection_source:=dam4sam (default) — DAM4SAM output remapped onto the
+  detection_source:=edgetam (default) — EdgeTAM output remapped onto the
                                         contract topic.
-  detection_source:=oracle           — oracle drives the contract topic.
+  detection_source:=oracle            — oracle drives the contract topic.
 
 Toggle:
   follower_kind:=bt (default) — runs the BT-based follow_everything_follower.
@@ -32,7 +32,7 @@ BT_FOLLOWER_PATH = "/opt/follow_everything_nav2/follower_pkg/python/follow_every
 
 def _bringup(context, *args, **kwargs):
     repo = os.environ.get("WS_ROOT", "/ws")
-    tracker = os.path.join(repo, "follower_pkg", "python", "dam4sam_tracker.py")
+    tracker = os.path.join(repo, "follower_pkg", "python", "edgetam_tracker.py")
     simple_follower = os.path.join(
         repo, "follower_pkg", "python", "simple_follower.py")
 
@@ -40,10 +40,10 @@ def _bringup(context, *args, **kwargs):
     follower_kind    = LaunchConfiguration("follower_kind").perform(context)
 
     tracker_cmd = [sys.executable, "-u", tracker]
-    if detection_source == "dam4sam":
+    if detection_source == "edgetam":
         tracker_cmd += [
             "--ros-args", "-r",
-            "/follower/camera/detections_dam4sam:=/follower/camera/detections",
+            "/follower/camera/detections_edgetam:=/follower/camera/detections",
         ]
 
     if follower_kind == "simple":
@@ -80,8 +80,8 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             "detection_source",
-            default_value="dam4sam",
-            description="dam4sam | oracle"),
+            default_value="edgetam",
+            description="edgetam | oracle"),
         DeclareLaunchArgument(
             "follower_kind",
             default_value="bt",

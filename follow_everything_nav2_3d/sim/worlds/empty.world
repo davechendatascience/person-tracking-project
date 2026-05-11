@@ -196,7 +196,7 @@
              can't peek over them — earlier mounted at z=1.55 m, just
              above wall tops, which let SAM2 sometimes lock onto the
              leader through what should have been an opaque obstacle.
-             Roughly chest-height of the 1.7 m leader. The dam4sam_tracker
+             Roughly chest-height of the 1.7 m leader. The edgetam_tracker
              CAM_OFFSET_X_BODY / CAM_OFFSET_Z_BODY constants must match. -->
         <sensor name="rgbd_camera" type="rgbd_camera">
           <pose>0.10 0 1.20 0 0 0</pose>

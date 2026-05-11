@@ -32,18 +32,29 @@ BT_FOLLOWER_PATH = "/opt/follow_everything_nav2/follower_pkg/python/follow_every
 
 def _bringup(context, *args, **kwargs):
     repo = os.environ.get("WS_ROOT", "/ws")
-    tracker = os.path.join(repo, "follower_pkg", "python", "edgetam_tracker.py")
     simple_follower = os.path.join(
         repo, "follower_pkg", "python", "simple_follower.py")
 
     detection_source = LaunchConfiguration("detection_source").perform(context)
     follower_kind    = LaunchConfiguration("follower_kind").perform(context)
+    tracker_kind     = LaunchConfiguration("tracker_kind").perform(context)
+
+    # Each tracker variant publishes on its own pre-remap topic; the
+    # `detection_source:=edgetam` arg below points that topic at the
+    # BT's contract topic regardless of which tracker is active.
+    if tracker_kind == "aot":
+        tracker_script = "aot_tracker.py"
+        tracker_topic  = "/follower/camera/detections_aot"
+    else:
+        tracker_script = "edgetam_tracker.py"
+        tracker_topic  = "/follower/camera/detections_edgetam"
+    tracker = os.path.join(repo, "follower_pkg", "python", tracker_script)
 
     tracker_cmd = [sys.executable, "-u", tracker]
     if detection_source == "edgetam":
         tracker_cmd += [
             "--ros-args", "-r",
-            "/follower/camera/detections_edgetam:=/follower/camera/detections",
+            f"{tracker_topic}:=/follower/camera/detections",
         ]
 
     if follower_kind == "simple":
@@ -81,7 +92,13 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "detection_source",
             default_value="edgetam",
-            description="edgetam | oracle"),
+            description="edgetam (tracker drives the contract topic) | "
+                        "oracle (oracle drives it directly)"),
+        DeclareLaunchArgument(
+            "tracker_kind",
+            default_value="edgetam",
+            description="edgetam (SAM2 fork, default) | "
+                        "aot (AOT/DeAOT family, occlusion-robust memory)"),
         DeclareLaunchArgument(
             "follower_kind",
             default_value="bt",

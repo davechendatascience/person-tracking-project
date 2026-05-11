@@ -37,6 +37,15 @@ services:
       # drop-in `sam2` package with build_sam2_video_predictor that takes
       # configs/edgetam.yaml + checkpoints/edgetam.pt.
       - ../EdgeTAM:/opt/EdgeTAM:ro
+      # AOT-benchmark (yoxu515/aot-benchmark) source — its
+      # `networks/layers/attention.py` already has a pure-PyTorch
+      # fallback when spatial_correlation_sampler can't be imported,
+      # so we mount the source and skip the CUDA-toolkit + correlation
+      # extension install path entirely.
+      - ../aot-benchmark:/opt/aot-benchmark:ro
+      # Persistent torch.hub cache (Cutie shares this; AOT also pulls
+      # ImageNet backbones via torch.hub on first run).
+      - ~/.cache/torch:/root/.cache/torch
       - ../yolo11m.pt:/opt/yolo11m.pt:ro
     working_dir: /ws
     stdin_open: true

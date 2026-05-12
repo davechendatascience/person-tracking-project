@@ -161,4 +161,6 @@ docker exec -it follow_everything_nav2_3d bash -lc \
 
 3D Gazebo forest 場景下，AOT 追蹤器持續追蹤領航員 60 秒（real-time 1× 播放，正面相機視角，紅色為 AOT 預測之 mask）：
 
-![Forest world tracking demo](resources/forest_world_tracking.gif)
+https://github.com/davechendatascience/person-tracking-project/raw/main/resources/forest_aot_overlay.mp4
+
+> GitHub 會把上面這個 raw mp4 連結自動嵌成內嵌播放器；如果你是在本地預覽 README 看不到播放器，影片檔本身在 [`resources/forest_aot_overlay.mp4`](resources/forest_aot_overlay.mp4)。

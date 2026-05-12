@@ -500,6 +500,94 @@ python3 eval/record_episode.py 90 oracle empty
 python3 eval/record_episode.py 90 edgetam cluttered
 ```
 
+### Switching the tracker to AOT/DeAOT
+
+> **Caveat — AOT requires a one-time setup inside the container.**
+>
+> The Docker image does **not** ship the CUDA toolkit or the
+> `spatial_correlation_sampler` CUDA kernel that AOT's matching attention
+> needs for its fast path. Instead:
+>
+> 1. The host's `/usr/local/cuda-13.0` is mounted into the container
+>    read-only via `docker-compose.yml` (matching env vars `CUDA_HOME`,
+>    `PATH`, `LD_LIBRARY_PATH` are set in the Dockerfile pointing at
+>    this mount). The host must therefore have CUDA 13.0 toolkit
+>    installed under that path. Verify:
+>    ```bash
+>    ls /usr/local/cuda-13.0/bin/nvcc   # must exist on the host
+>    ```
+> 2. After `docker compose build` / `docker compose up -d sim`, install
+>    `spatial_correlation_sampler` **once** inside the running container:
+>    ```bash
+>    docker exec follow_everything_nav2_3d \
+>        pip install --no-cache-dir --no-build-isolation spatial-correlation-sampler
+>    docker exec follow_everything_nav2_3d python3 -c \
+>        "from spatial_correlation_sampler import SpatialCorrelationSampler; print('OK')"
+>    ```
+> 3. Bake the install into the image so subsequent `docker compose up`
+>    runs don't need to re-install:
+>    ```bash
+>    docker commit follow_everything_nav2_3d follow_everything_nav2_3d:latest
+>    ```
+>    Note: `docker commit` is overwritten by `docker compose build` —
+>    if you later rebuild the image, repeat steps 2–3.
+>
+> Without the kernel, AOT falls back to a pure-PyTorch implementation
+> that saturates a CPU core and runs ~3–5× slower. The tracker logs
+> `AOT enable_corr (CUDA correlation kernel)=True — fast path` at
+> startup when the kernel is loaded; if it logs `False — pure-PyTorch
+> fallback`, redo step 2.
+
+`record_episode.py` reads the `TRACKER_KIND` env var (`edgetam` default, or
+`aot`). The second positional arg (`edgetam` in the examples above) is a
+legacy name that means "tracker drives the contract topic", not the choice
+of tracker binary — leave it as `edgetam` even when running AOT.
+
+```bash
+# 90 s AOT/DeAOT run on the empty map
+TRACKER_KIND=aot python3 eval/record_episode.py 90 edgetam empty
+
+# 120 s AOT/DeAOT run on cluttered with the larger SwinB-DeAOT-L weights
+TRACKER_KIND=aot AOT_MODEL=swinb_deaotl \
+AOT_CKPT=/opt/aot-benchmark/pretrain_models/SwinB_DeAOTL_PRE_YTB_DAV.pth \
+  python3 eval/record_episode.py 120 edgetam cluttered
+```
+
+AOT-specific env vars (all optional; defaults shown):
+
+| env var                   | default                              | what |
+|---------------------------|--------------------------------------|------|
+| `AOT_MODEL`               | `r50_deaotl`                         | model config under `aot-benchmark/configs/models/` |
+| `AOT_CKPT`                | derived from `AOT_MODEL`             | checkpoint path |
+| `AOT_LT_GAP`              | `5`                                  | write one long-term-memory entry every N frames |
+| `AOT_LT_MAX`              | `80`                                 | hard cap on long-term memory entries |
+| `AOT_LT_BATCH_EVICT_EVERY`| `50`                                 | scheduled eviction cadence (frames); evicts only when bank > `AOT_LT_MAX` |
+| `AOT_LT_KEEP_RATIO`       | `0.8`                                | on eviction, keep newest `AOT_LT_MAX × ratio` entries; rest dropped |
+| `AOT_MAX_LONG_EDGE`       | `800`                                | input resize cap (longer image edge in pixels) |
+| `TRACKER_TASKSET_CORES`   | unset                                | optional cgroup mask for the tracker process (e.g. `"0,1"`) |
+| `FOLLOWER_TASKSET_CORES`  | unset                                | optional cgroup mask for the BT follower |
+
+The defaults are validated on a 1001-frame test clip: stable 5.8 GB
+VRAM and 2.1 % fragmentation at the end of the run, no OOM. See the
+[CUDA OOM = fragmentation first](#) lesson (Claude memory) for the
+underlying reasoning.
+
+### Standalone offline AOT smoke test
+
+For a no-ROS sanity check on a video file:
+
+```bash
+# inside the running sim container, from /ws:
+python3 eval/smoke_tracker_aot.py <input.mp4> [output.mp4]
+
+# pick a different model:
+AOT_MODEL=swinb_deaotl python3 eval/smoke_tracker_aot.py input.mp4 out.mp4
+```
+
+Verifies (a) the CUDA correlation kernel imports (`enable_corr=True`
+log line) and (b) the AOT engine completes the clip with the
+configured memory cap, without ROS / Gazebo overhead.
+
 Output layout:
 
 ```

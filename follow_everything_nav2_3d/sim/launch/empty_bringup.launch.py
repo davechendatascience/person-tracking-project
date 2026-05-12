@@ -106,7 +106,7 @@ def _bringup(context, *args, **kwargs):
     )
 
     oracle_cmd = ["python3", "-u", oracle_path]
-    if detection_source == "dam4sam":
+    if detection_source == "edgetam":
         oracle_cmd += [
             "--ros-args", "-r",
             "/follower/camera/detections:=/follower/camera/detections_oracle",
@@ -132,11 +132,11 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             "detection_source",
-            default_value="dam4sam",
+            default_value="edgetam",
             description="Which source drives /follower/camera/detections: "
-                        "'dam4sam' (primary, oracle moves to _oracle) or "
-                        "'oracle' (oracle on contract topic, DAM4SAM stays "
-                        "on _dam4sam).",
+                        "'edgetam' (primary, oracle moves to _oracle) or "
+                        "'oracle' (oracle on contract topic, EdgeTAM stays "
+                        "on _edgetam).",
         ),
         DeclareLaunchArgument(
             "map",

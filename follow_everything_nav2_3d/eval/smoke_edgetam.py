@@ -12,8 +12,8 @@ Run inside the container:
 import sys
 import time
 
-# EdgeTAM ships a `sam2` package; insert its parent so the import path resolves
-# to EdgeTAM's fork instead of the parent DAM4SAM's vendored sam2.
+# EdgeTAM ships its own `sam2` package; insert /opt/EdgeTAM at the front
+# of sys.path so `from sam2 ...` resolves to EdgeTAM's fork.
 sys.path.insert(0, "/opt/EdgeTAM")
 
 import numpy as np

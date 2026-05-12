@@ -50,7 +50,7 @@ RUN ign fuel download \
         -u "https://fuel.gazebosim.org/1.0/Mingfei/models/actor" \
         -v 4 || echo "[warn] Fuel pre-cache failed; will retry at runtime."
 
-# --- Phase 4b-i: ML stack for DAM4SAM ----------------------------------------
+# --- Phase 4b-i: ML stack for EdgeTAM / SAM2 ---------------------------------
 # Host is Grace Blackwell (sbsa aarch64) with CUDA 13.0 driver. CUDA 13 is
 # backward-compatible with cu12.x runtime, so we use the cu126 PyTorch wheels —
 # they have aarch64 binaries on download.pytorch.org and are stable. (No
@@ -77,6 +77,27 @@ RUN pip install --no-cache-dir \
         tqdm \
         scipy \
         py_trees
+
+# ── AOT speed-up: build deps only, kernel installed at runtime ───────────────
+# spatial_correlation_sampler needs the CUDA toolkit (nvcc + dev headers
+# + libs) to compile. Instead of apt-installing the toolkit inside the
+# image (~500 MB download from NVIDIA's CDN, prone to DNS flakes), we
+# mount the host's /usr/local/cuda-13.0 at runtime via docker-compose
+# and install the kernel inside the running container once. Only the
+# build *tools* that aren't on NVIDIA's repo (ninja, python3.10-dev) are
+# installed here so the runtime install is one-line.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        python3.10-dev \
+        ninja-build \
+ && rm -rf /var/lib/apt/lists/*
+ENV CUDA_HOME=/usr/local/cuda-13.0 \
+    PATH=/usr/local/cuda-13.0/bin:${PATH} \
+    LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:${LD_LIBRARY_PATH}
+
+# spatial_correlation_sampler intentionally NOT installed here — install
+# at runtime once the host CUDA toolkit is mounted:
+#   docker compose run --rm sim pip install --no-cache-dir --no-build-isolation spatial-correlation-sampler
 
 WORKDIR /ws
 # PYTHONPATH:

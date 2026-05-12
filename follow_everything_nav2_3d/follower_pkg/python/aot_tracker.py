@@ -1,31 +1,50 @@
-"""EdgeTAM streaming tracker bridge.
+"""AOT/DeAOT streaming tracker bridge.
 
-Online streaming wrapper around EdgeTAM (facebookresearch/EdgeTAM), a
-SAM2-compatible video predictor optimised for edge devices. Replaces
-the earlier DAM4SAM-based bridge — DAM4SAM's DRM didn't help on our
-low-poly actor, and EdgeTAM's lighter backbone tracks at ~20 Hz vs
-DAM4SAM's ~3 Hz.
+Parallel ROS node to edgetam_tracker.py / cutie_tracker.py that runs
+the AOT family (yoxu515/aot-benchmark) — DeAOT, R50-DeAOTL, etc. —
+as the streaming tracker. Picks model variant via the AOT_MODEL env
+var; default is R50-DeAOTL (VOT-grade memory + matching architecture).
 
-EdgeTAM ships a fork of SAM2's `sam2` package; we drive it through the
-streaming pattern (manual inference_state dict, propagate_in_video with
-max_frame_num_to_track=0) inlined in _build_edgetam_streaming_tracker.
+Per-frame flow mirrors `tools/demo.py` from the AOT repo:
+  frame 0 → engine.add_reference_frame(img, mask, ...)
+  frame N → engine.match_propogate_one_frame(img)
+            + engine.decode_current_logits((H, W))
 
-The camera is 20 Hz; we publish on /follower/camera/detections_edgetam
+Two extras over vanilla:
+  * Spatial-correlation-sampler is NOT required — the AOT source has
+    a pure-PyTorch fallback (networks/layers/attention.py:213-219 et
+    al.) we lean on, so no CUDA toolkit / extension compile.
+  * DMAOT-style FIFO cap on the long-term memory bank. Vanilla
+    DeAOT grows memory unboundedly (concat-along-dim-0 every Nth
+    frame) → OOM on long videos (~355 frames @ 1040px on edge).
+    The wrapper monkey-patches update_long_term_memory to keep
+    only the most-recent AOT_LT_MAX entries.
+
+The camera is 20 Hz; we publish on /follower/camera/detections_aot
 at the tracker's actual rate. On every track() call we snapshot the
 *latest* camera RGB; frames that arrived while the tracker was busy
 are dropped.
 
-Bootstrap: oracle leader pose builds a depth-filtered init mask on the
-first incoming RGB frame; that mask becomes the EdgeTAM init prompt.
-Until then the node publishes empty Detection2DArrays.
+Bootstrap: oracle leader pose gives us a bbox. We hand AOT a filled-
+rectangle mask from that bbox at frame 0 — AOT's memory attention
+refines the silhouette over the next few frames. Until init, the
+node publishes empty Detection2DArrays.
 """
 import os
-# Must be set before torch is imported anywhere. Tells the CUDA caching
-# allocator to use expandable segments — fragmented reserved memory is
-# returned to the OS instead of held forever, which keeps VRAM bounded
-# under our pruning loop below.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# Must be set before torch is imported anywhere. Allocator tweaks for
+# long-running tracking (validated via the AOT demo on a 1001-frame
+# clip): max_split_size_mb=128 keeps big blocks intact for the
+# long-term memory bank's concat operations;
+# garbage_collection_threshold=0.7 proactively releases free segments;
+# expandable_segments returns fragmented reserved memory to the OS
+# instead of hoarding it. The demo showed frag dropping from 4.2% to
+# 2.1% over a 1001-frame run with this config.
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "max_split_size_mb:128,garbage_collection_threshold:0.7,expandable_segments:True",
+)
 
+import gc
 import math
 import sys
 import threading
@@ -68,7 +87,7 @@ SAM2_CFG = {
     # `sam2` package and checkpoint. ~10× faster propagation than
     # sam2_hiera_large; we replaced the DAM4SAM (DRM) wrapper with an
     # inline streaming wrapper that drives EdgeTAM directly — no
-    # DAM4SAM dependency. See _build_edgetam_streaming_tracker.
+    # DAM4SAM dependency. See _build_aot_streaming_tracker.
     "model_cfg":  "configs/edgetam.yaml",
     "checkpoint": "/opt/EdgeTAM/checkpoints/edgetam.pt",
     "device":     "cuda",
@@ -142,9 +161,9 @@ def _stamp_to_ns(t) -> int:
 
 
 # ---------------------------------------------------------------------------
-class EdgeTAMTracker(Node):
+class AOTTracker(Node):
     def __init__(self) -> None:
-        super().__init__("edgetam_tracker")
+        super().__init__("aot_tracker")
 
         # ---- Atomic snapshot of the latest ROS frame --------------------
         self._snap_lock = threading.Lock()
@@ -229,12 +248,12 @@ class EdgeTAMTracker(Node):
         # world_odom_publisher.py (matches the frame the BT uses).
         self.create_subscription(Odometry, "/follower/odom", self._on_odom, 20)
         self.pub = self.create_publisher(
-            Detection2DArray, "/follower/camera/detections_edgetam", 10)
+            Detection2DArray, "/follower/camera/detections_aot", 10)
         # Debug overlay — RGB frame SAM2 actually processed, with mask
         # tinted red, centroid drawn, and frame_idx in the corner. View in
         # RViz with fixed_frame=follower/camera_optical_frame.
         self.overlay_pub = self.create_publisher(
-            Image, "/follower/camera/edgetam_overlay", 10)
+            Image, "/follower/camera/aot_overlay", 10)
 
         # 50 Hz drain — non-blocking. Whenever SAM2 has yielded, we publish.
         self.create_timer(0.02, self._publish_results)
@@ -243,7 +262,7 @@ class EdgeTAMTracker(Node):
         self._worker.start()
 
         self.get_logger().info(
-            f"EdgeTAM tracker live. "
+            f"AOT tracker live. "
             f"awaiting first 'person' YOLO detection (conf ≥ {YOLO_CONF}); "
             f"detection topic ticks at the tracker's own rate "
             f"(slower than the camera).")
@@ -571,10 +590,10 @@ class EdgeTAMTracker(Node):
 
         log = self.get_logger()
         try:
-            tracker = self._build_edgetam_streaming_tracker(log)
+            tracker = self._build_aot_streaming_tracker(log)
         except Exception as e:
             import traceback
-            log.error(f"EdgeTAM build failed: {e!r}\n{traceback.format_exc()}")
+            log.error(f"AOT build failed: {e!r}\n{traceback.format_exc()}")
             return
 
         from PIL import Image as PILImage
@@ -588,21 +607,42 @@ class EdgeTAMTracker(Node):
 
         init_pil = PILImage.fromarray(self._init_rgb)
         try:
-            # EdgeTAM tracks most reliably from a bbox prompt — its
-            # appearance head locks onto the dense bbox region rather
-            # than a sparse depth-filtered mask. We always pass the
-            # oracle bbox; the depth-filtered mask is dropped (the
-            # mask-based path was producing 0-px propagated masks).
+            # AOT (unlike SAM2/EdgeTAM) is trained on dense per-object
+            # masks from YT-VOS / DAVIS — it expects a real silhouette,
+            # not a bbox blob. The oracle bootstrap path builds a
+            # depth-filtered mask at `self._init_mask`; we pass that
+            # straight through when available. Filled-rect-from-bbox
+            # confuses AOT's first-frame conditioning because the
+            # rect covers visible background (sky, ground, trees in
+            # forest map), which AOT then treats as part of the
+            # target → drift the moment the bot moves.
+            #
+            # Fallback: if the depth-filtered mask is too sparse
+            # (< MIN_INIT_MASK_PX), fall back to bbox-only and let
+            # the wrapper convert to filled rect — better than nothing.
             init_bbox = self._init_bbox.astype(np.float32).tolist()
-            out_dict = tracker.initialize(
-                init_pil, init_mask=None, bbox=init_bbox)
+            init_mask = self._init_mask
+            MIN_INIT_MASK_PX = 100
+            if init_mask is not None and int(init_mask.sum()) >= MIN_INIT_MASK_PX:
+                log.info(
+                    f"AOT init source: depth-filtered mask "
+                    f"(px={int(init_mask.sum())}, bbox={init_bbox})")
+                out_dict = tracker.initialize(
+                    init_pil, init_mask=init_mask, bbox=None)
+            else:
+                log.warn(
+                    f"AOT init source: bbox→filled-rect fallback "
+                    f"(depth mask px={0 if init_mask is None else int(init_mask.sum())} "
+                    f"< {MIN_INIT_MASK_PX}, bbox={init_bbox})")
+                out_dict = tracker.initialize(
+                    init_pil, init_mask=None, bbox=init_bbox)
         except Exception as e:
             import traceback
-            log.error(f"EdgeTAM initialize crashed: {e!r}\n{traceback.format_exc()}")
+            log.error(f"AOT initialize crashed: {e!r}\n{traceback.format_exc()}")
             return
         mask0 = out_dict["pred_mask"]
         log.info(
-            f"EdgeTAM init: mask shape={mask0.shape} px_on={int(mask0.sum())} "
+            f"AOT init: mask shape={mask0.shape} px_on={int(mask0.sum())} "
             f"bbox={self._init_bbox.tolist()}")
         # Debug-dump init RGB + bbox + predicted mask so we can see what
         # EdgeTAM was shown when it failed to lock on. Saved to a stable
@@ -622,10 +662,16 @@ class EdgeTAMTracker(Node):
                             (mask0 * 255).astype(np.uint8))
             except Exception as e:
                 log.warn(f"debug init dump failed: {e!r}")
-        self._push_result(0, self._make_result(mask0))
+        # Pass the wrapper's smart centroid (prob-weighted + EMA) into
+        # _make_result instead of letting it compute a geometric mean
+        # over the binary mask.
+        self._push_result(0, self._make_result(mask0, out_dict.get("centroid_uv")))
         vis_n = 1 if mask0.any() else 0
         inv_n = 0 if mask0.any() else 1
-        debug_frames_left = 8  # dump first 8 propagated frames
+        # Dump overlay PNGs for the first N propagated frames. Default 8
+        # for quick smoke-debug; bump via AOT_DEBUG_FRAMES env var to
+        # generate a per-frame video of the full episode.
+        debug_frames_left = int(os.environ.get("AOT_DEBUG_FRAMES", "8"))
 
         # ---- Streaming loop: one track() per fresh ROS frame --------
         LOG_EVERY = 30
@@ -639,8 +685,24 @@ class EdgeTAMTracker(Node):
         # re-reads its cached features each step. Everything else past
         # STATE_KEEP_BEHIND can go.
         frame_idx = 1
+        # Worker-rate throttle. Pure-PyTorch AOT can saturate a CPU
+        # core, which makes the BT/Nav2 thread (on the same host
+        # network) lag. The BT ticks at ~20 Hz and Nav2 plans at
+        # ~10 Hz, so 8-12 Hz of fresh detections is plenty. Cap the
+        # worker so we leave headroom for the rest of the stack.
+        # Set TRACKER_MAX_HZ=0 to disable the cap (run flat-out).
+        tracker_max_hz = float(os.environ.get("TRACKER_MAX_HZ", "10"))
+        min_period = (1.0 / tracker_max_hz) if tracker_max_hz > 0 else 0.0
+        last_iter_t = time.time()
         try:
             while not self._stop.is_set() and frame_idx < MAX_FRAMES:
+                # Pace the worker — sleep the remainder of the slot
+                # if we finished a frame faster than min_period.
+                if min_period > 0:
+                    sleep_for = min_period - (time.time() - last_iter_t)
+                    if sleep_for > 0.001:
+                        time.sleep(sleep_for)
+                last_iter_t = time.time()
                 rgb, depth, K, stamp = self._snapshot_latest_blocking()
                 if rgb is None:
                     return  # stop event or timeout
@@ -657,7 +719,9 @@ class EdgeTAMTracker(Node):
                     vis_n += 1
                 else:
                     inv_n += 1
-                self._push_result(frame_idx, self._make_result(mask))
+                self._push_result(
+                    frame_idx,
+                    self._make_result(mask, out_dict.get("centroid_uv")))
                 if debug_frames_left > 0 and debug_dir:
                     try:
                         overlay = rgb.copy()
@@ -675,10 +739,15 @@ class EdgeTAMTracker(Node):
                         log.warn(f"debug track dump failed: {e!r}")
                     debug_frames_left -= 1
 
-                self._evict_edgetam_state(
+                self._evict_aot_state(
                     tracker, frame_idx, STATE_KEEP_BEHIND)
 
                 if frame_idx % EMPTY_CACHE_EVERY == 0:
+                    # gc.collect() before empty_cache() so Python releases
+                    # any zero-refcount CUDA tensors back to the caching
+                    # allocator first; empty_cache() can then actually
+                    # return those segments to the OS.
+                    gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
@@ -687,7 +756,7 @@ class EdgeTAMTracker(Node):
                         torch.cuda.memory_allocated() / 1e9
                         if torch.cuda.is_available() else 0.0)
                     log.info(
-                        f"edgetam f={frame_idx} "
+                        f"aot f={frame_idx} "
                         f"vis={vis_n}/{vis_n+inv_n} "
                         f"last_mask_px={int(mask.sum())} "
                         f"cuda alloc={alloc_gb:.2f}GB")
@@ -697,7 +766,7 @@ class EdgeTAMTracker(Node):
             import traceback
             log.error(f"tracker_worker crashed: {e!r}\n{traceback.format_exc()}")
 
-    def _evict_edgetam_state(
+    def _evict_aot_state(
         self, tracker, frame_idx: int, keep_behind: int,
     ) -> None:
         """Drop per-frame state in EdgeTAM's inference_state + predictor
@@ -740,173 +809,466 @@ class EdgeTAMTracker(Node):
                 del ft[k]
 
     # ------------------------------------------------------------------
-    # EdgeTAM helpers — kept as instance methods so they're easy to test.
+    # AOT helpers — kept as instance methods so they're easy to test.
     # ------------------------------------------------------------------
-    def _build_edgetam_streaming_tracker(self, log):
-        """Build EdgeTAM's video predictor and wrap it in a streaming
-        tracker that exposes the same .initialize / .track API the rest
-        of this file expects, without depending on DAM4SAM or its DRM.
+    def _build_aot_streaming_tracker(self, log):
+        """Build the AOT/DeAOT video object segmenter from
+        yoxu515/aot-benchmark and wrap it in a streaming tracker that
+        exposes the same .initialize / .track API the rest of this
+        file expects.
 
-        EdgeTAM is a drop-in SAM2 fork (same `sam2` package layout) but
-        with a smaller, faster model. SAM2's standard init_state(...)
-        only accepts MP4 / JPEG-folder paths; for streaming we build the
-        inference_state dict by hand (init_state_tw) and advance one
-        frame at a time via propagate_in_video(start, max=0). This is
-        the same pattern DAM4SAM uses internally — minus the DRM
-        (Distractor Rejection Module)."""
+        Mirrors the inference flow of `tools/demo.py` from the AOT
+        repo (paper-faithful preprocessing, single-scale, decoder
+        upsamples back to video resolution per frame). Two extras
+        we layer on top of vanilla DeAOT here, both targeting the
+        unbounded-memory failure mode that caps long videos:
+
+          - DMAOT-style FIFO cap on the long-term memory bank.
+            Vanilla DeAOT's `update_long_term_memory` concatenates
+            features per layer along dim=0 every TEST_LONG_TERM_MEM_GAP
+            frames with no eviction → GPU OOM at ~355 frames on the
+            pure-PyTorch fallback. We monkey-patch the engine class
+            to keep only the most-recent AOT_LT_MAX entries (oldest
+            evicted first). DMAOT proper uses cosine-similarity
+            dropout to keep the *most informative* frames; FIFO is the
+            cheap bounded variant.
+          - LONG_TERM_MEM_GAP override (env var AOT_LT_GAP), so
+            ROS can use a denser default than the engine's stage cfg.
+
+        We also skip the spatial_correlation_sampler dependency: the
+        AOT source has try/except + pure-PyTorch fallbacks at every
+        usage site (networks/layers/attention.py:213-219 et al.).
+        That saves us a CUDA toolkit install in the Dockerfile."""
         import os
-        from collections import OrderedDict
+        import importlib
         import torch
-        import torch.nn.functional as F
 
-        # Insert EdgeTAM's repo on sys.path so `from sam2 ...` resolves
-        # to EdgeTAM's fork (it ships its own `sam2/` directory).
-        sys.path.insert(0, "/opt/EdgeTAM")
-        from sam2.build_sam import build_sam2_video_predictor
+        sys.path.insert(0, "/opt/aot-benchmark")
 
-        device = (torch.device(SAM2_CFG["device"])
-                  if torch.cuda.is_available()
-                  else torch.device("cpu"))
-        ckpt = SAM2_CFG["checkpoint"]
-        ckpt_size_mb = (os.path.getsize(ckpt) / (1024 * 1024)
-                        if os.path.exists(ckpt) else -1)
+        # Config — picks model variant via env var so the same node
+        # can drive r50_deaotl / deaott / deaotl / etc. AOT_CKPT
+        # defaults to the matching checkpoint for AOT_MODEL so callers
+        # don't have to set both; only override if they want a
+        # non-standard checkpoint.
+        aot_model = os.environ.get("AOT_MODEL", "r50_deaotl")
+        aot_stage = os.environ.get("AOT_STAGE", "pre_ytb_dav")
+        _ckpt_for_model = {
+            "r50_deaotl": "R50_DeAOTL_PRE_YTB_DAV.pth",
+            "deaott":     "DeAOTT_PRE_YTB_DAV.pth",
+            "deaots":     "DeAOTS_PRE_YTB_DAV.pth",
+            "deaotb":     "DeAOTB_PRE_YTB_DAV.pth",
+            "deaotl":     "DeAOTL_PRE_YTB_DAV.pth",
+            "aott":       "AOTT_PRE_YTB_DAV.pth",
+            "aots":       "AOTS_PRE_YTB_DAV.pth",
+            "aotb":       "AOTB_PRE_YTB_DAV.pth",
+            "aotl":       "AOTL_PRE_YTB_DAV.pth",
+            "r50_aotl":   "R50_AOTL_PRE_YTB_DAV.pth",
+        }
+        aot_ckpt  = os.environ.get(
+            "AOT_CKPT",
+            f"/opt/aot-benchmark/pretrain_models/"
+            f"{_ckpt_for_model.get(aot_model, 'R50_DeAOTL_PRE_YTB_DAV.pth')}")
+        aot_lt_gap = int(os.environ.get("AOT_LT_GAP", "5"))
+        # Demo-validated default: gap=5 + lt_max=80 + batched eviction
+        # produced 636/1001 non-empty (best of all variants tested) with
+        # stable 5.8 GB / 2.1% frag. lt_max=30 worked but is more
+        # aggressive than necessary on Grace Blackwell-class VRAM.
+        aot_lt_max = int(os.environ.get("AOT_LT_MAX", "80"))
+        aot_lt_batch_evict = int(os.environ.get("AOT_LT_BATCH_EVICT_EVERY", "50"))
+        aot_lt_keep_ratio = float(os.environ.get("AOT_LT_KEEP_RATIO", "0.8"))
+        aot_max_long_edge = int(os.environ.get("AOT_MAX_LONG_EDGE", "800"))
+
         log.info(
-            f"EdgeTAM streaming tracker device={device}, "
-            f"cfg={SAM2_CFG['model_cfg']} ckpt={ckpt} ({ckpt_size_mb:.0f} MB), "
-            f"building predictor (slow first time)...")
+            f"AOT tracker model={aot_model} stage={aot_stage} ckpt={aot_ckpt}")
 
-        input_size = SAM2_CFG["image_size"]
+        engine_config_mod = importlib.import_module(f"configs.{aot_stage}")
+        cfg = engine_config_mod.EngineConfig("ros", aot_model)
+        cfg.TEST_GPU_ID = 0
+        cfg.TEST_CKPT_PATH = aot_ckpt
+        cfg.TEST_LONG_TERM_MEM_GAP = aot_lt_gap
+
+        device = (torch.device("cuda")
+                  if torch.cuda.is_available() else torch.device("cpu"))
+        gpu_id = 0 if device.type == "cuda" else -1
+
+        # Confirm whether the CUDA correlation kernel was importable.
+        # If False we're on the slower pure-PyTorch fallback path.
+        try:
+            from networks.layers.attention import enable_corr as _enable_corr
+        except Exception:
+            _enable_corr = None
+        log.info(
+            f"AOT enable_corr (CUDA correlation kernel)={_enable_corr} "
+            f"— {'fast path' if _enable_corr else 'pure-PyTorch fallback'}")
+        log.info(
+            f"AOT memory: LT_GAP={aot_lt_gap} (store every Nth frame), "
+            f"LT_MAX={aot_lt_max} (cap), "
+            f"BATCH_EVICT_EVERY={aot_lt_batch_evict} frames, "
+            f"KEEP_RATIO={aot_lt_keep_ratio}")
+
+        from networks.models import build_vos_model
+        from networks.engines import build_engine
+        from utils.checkpoint import load_network
+
+        # ── Batched-eviction long-term memory cap ───────────────────
+        # Demo-validated (1001-frame video, gap=5): batched eviction
+        # every N frames keeping newest keep_ratio*max is friendlier to
+        # the CUDA allocator than per-frame trimming (4.2% → 2.1% frag
+        # drop across the run, vs growing frag with per-call slicing).
+        # Hard safety cap at max*1.5 catches any pathological growth
+        # between scheduled batch evictions. Newest entries are at the
+        # FRONT of the concat (torch.cat([new, last], dim=0)), so we
+        # slice [:keep*HW] = keep newest, drop oldest.
+        # MODEL_ENGINE is 'aotengine' or 'deaotengine' (no underscore);
+        # the file lives at networks/engines/{aot,deaot}_engine.py.
+        if cfg.MODEL_ENGINE.startswith("deaot"):
+            engine_module = importlib.import_module(
+                "networks.engines.deaot_engine")
+            engine_cls = engine_module.DeAOTEngine
+            engine_cls_name = "DeAOTEngine"
+        else:
+            engine_module = importlib.import_module(
+                "networks.engines.aot_engine")
+            engine_cls = engine_module.AOTEngine
+            engine_cls_name = "AOTEngine"
+
+        # Reset prior monkey-patch (cap-only version) if present, so a
+        # reload uses the new batched-eviction logic.
+        if getattr(engine_cls, "_lt_cap_installed", False):
+            log.info("Re-installing long-term memory cap with new strategy.")
+
+        # Capture engine-class import for use inside the closure.
+        AOTEngine_cls = engine_cls
+        _hard_cap = int(aot_lt_max * 1.5) if aot_lt_max > 0 else 0
+        _keep_frames = max(1, int(aot_lt_max * aot_lt_keep_ratio)) \
+            if aot_lt_max > 0 else 0
+        _evict_stats = {"calls": 0, "last_log": 0}
+
+        def _batch_evict_update(self, new_long_term_memories,
+                                _cap=aot_lt_max,
+                                _hard=_hard_cap,
+                                _keep=_keep_frames,
+                                _every=aot_lt_batch_evict,
+                                _stats=_evict_stats,
+                                _log=log):
+            if self.long_term_memories is None:
+                self.long_term_memories = new_long_term_memories
+                return
+
+            # Token count per frame (HW) — uniform across all layers.
+            HW = None
+            for layer in new_long_term_memories:
+                for e in layer:
+                    if e is not None:
+                        HW = e.shape[0]
+                        break
+                if HW is not None:
+                    break
+
+            do_batch = (
+                _cap > 0 and _every > 0 and self.frame_step > 0
+                and (self.frame_step % _every) == 0)
+
+            updated = []
+            evicted = False
+            for new_lm, last_lm in zip(
+                    new_long_term_memories, self.long_term_memories):
+                layer_out = []
+                for new_e, last_e in zip(new_lm, last_lm):
+                    if new_e is None or last_e is None:
+                        layer_out.append(None)
+                        continue
+                    cat = torch.cat([new_e, last_e], dim=0)
+                    if HW is not None and _cap > 0:
+                        T = cat.shape[0] // HW
+                        # Hard safety cap — fires only if scheduled
+                        # eviction was somehow missed.
+                        if T > _hard:
+                            cat = cat[: _hard * HW].contiguous()
+                            evicted = True
+                        elif do_batch and T > _cap:
+                            cat = cat[: _keep * HW].contiguous()
+                            evicted = True
+                    layer_out.append(cat)
+                updated.append(layer_out)
+            self.long_term_memories = updated
+
+            if evicted:
+                _stats["calls"] += 1
+                if (_stats["calls"] - _stats["last_log"]) >= 5 \
+                        or _stats["calls"] == 1:
+                    _stats["last_log"] = _stats["calls"]
+                    _log.info(
+                        f"AOT LT-cap batch evict "
+                        f"(frame={self.frame_step}, kept={_keep}, "
+                        f"max={_cap}, total_evicts={_stats['calls']})")
+
+        engine_cls.update_long_term_memory = _batch_evict_update
+        engine_cls._lt_cap_installed = True
+        engine_cls._dmaot_capped = True  # legacy flag, keep for back-compat
+        log.info(
+            f"Installed batched-eviction long-term memory cap on "
+            f"{engine_cls_name}.update_long_term_memory "
+            f"(max={aot_lt_max}, batch_every={aot_lt_batch_evict}, "
+            f"keep={_keep_frames}, hard_cap={_hard_cap})")
+
+        # ── Build model + engine ────────────────────────────────────
         _t_build = time.time()
-        predictor = build_sam2_video_predictor(
-            SAM2_CFG["model_cfg"], ckpt, device=device)
+        model = build_vos_model(cfg.MODEL_VOS, cfg)
+        if device.type == "cuda":
+            model = model.cuda(gpu_id)
+        else:
+            model = model.to(device)
+        model, _ = load_network(model, cfg.TEST_CKPT_PATH, gpu_id)
+        model.eval()
+        engine = build_engine(
+            cfg.MODEL_ENGINE,
+            phase="eval",
+            aot_model=model,
+            gpu_id=gpu_id,
+            long_term_mem_gap=cfg.TEST_LONG_TERM_MEM_GAP,
+        )
         log.info(
-            f"EdgeTAM predictor built in {time.time() - _t_build:.1f}s "
-            "(ready for first frame)")
-        img_mean = torch.tensor(
-            [0.485, 0.456, 0.406], dtype=torch.float32, device=device)[:, None, None]
-        img_std = torch.tensor(
-            [0.229, 0.224, 0.225], dtype=torch.float32, device=device)[:, None, None]
+            f"AOT predictor built in {time.time() - _t_build:.1f}s "
+            f"(ready for first frame)")
 
-        class _EdgeTAMStreamingTracker:
-            """Minimal streaming wrapper around EdgeTAM's video predictor."""
+        img_mean = torch.tensor(
+            [0.485, 0.456, 0.406], dtype=torch.float32, device=device)
+        img_std = torch.tensor(
+            [0.229, 0.224, 0.225], dtype=torch.float32, device=device)
+
+        class _AOTStreamingTracker:
+            """Thin streaming wrapper around the AOT engine.
+
+            Preprocessing reproduces MultiRestrictSize + MultiToTensor
+            from the AOT repo (max_long_edge cap, stride-16 alignment
+            with the align_corners +1 trick, ImageNet normalization).
+            Per-frame flow mirrors `tools/demo.py`:
+              - frame 0 → engine.add_reference_frame(img, mask, ...)
+              - frame N → engine.match_propogate_one_frame(img)
+                          + engine.decode_current_logits((H, W))
+            """
+
             def __init__(self):
-                self.predictor = predictor
-                self.input_image_size = input_size
+                self.engine = engine
+                self.model = model
+                self.device = device
                 self.img_mean = img_mean
                 self.img_std = img_std
+                self.max_long_edge = aot_max_long_edge
+                self.align_corners = bool(cfg.MODEL_ALIGN_CORNERS)
                 self.frame_index = 0
-                self.img_width = 0
-                self.img_height = 0
-                self.inference_state = None
+                self.video_h = 0
+                self.video_w = 0
+                self.input_h = 0
+                self.input_w = 0
+                # Centroid history for the prob-weighted + blob-tracking
+                # + EMA smoothing pipeline in _logit_to_result. Set on
+                # frame 0's add_reference_frame; updated each track().
+                self._last_centroid_uv: Optional[Tuple[float, float]] = None
 
-            def _prepare_image(self, image_pil):
+            def _aligned(self, n):
+                """Round n to align with stride 16, mirroring
+                MultiRestrictSize. With align_corners=True the
+                AOT repo uses (n-1) % 16 == 0, otherwise n % 16 == 0."""
+                stride = 16
+                if self.align_corners:
+                    return int(round((n - 1) / stride) * stride) + 1
+                return int(round(n / stride) * stride)
+
+            def _prep_image(self, image_pil):
+                """PIL image → (1, 3, H', W') float tensor on device."""
                 arr = np.array(image_pil)
-                t = torch.from_numpy(arr).to(device).permute(2, 0, 1).float() / 255.0
-                t = F.interpolate(
-                    t.unsqueeze(0),
-                    size=(self.input_image_size, self.input_image_size),
-                    mode="bilinear", align_corners=False).squeeze(0)
-                return (t - self.img_mean) / self.img_std
+                h, w = arr.shape[:2]
+                long_edge = max(h, w)
+                scale = (self.max_long_edge / long_edge
+                         if long_edge > self.max_long_edge else 1.0)
+                new_h = max(17, self._aligned(int(h * scale)))
+                new_w = max(17, self._aligned(int(w * scale)))
+                if (new_h, new_w) != (h, w):
+                    arr = cv2.resize(arr, (new_w, new_h),
+                                     interpolation=cv2.INTER_CUBIC)
+                self.input_h, self.input_w = new_h, new_w
+                t = (torch.from_numpy(arr).to(self.device)
+                     .permute(2, 0, 1).float() / 255.0)
+                t = (t - self.img_mean[:, None, None]) / self.img_std[:, None, None]
+                return t.unsqueeze(0)
 
-            def _new_state(self):
-                """Manual inference_state dict — same keys SAM2 / EdgeTAM
-                touch internally, just no MP4/JPEG video loader."""
-                s = {}
-                s["images"] = {}
-                s["num_frames"] = 0
-                s["offload_video_to_cpu"] = False
-                s["offload_state_to_cpu"] = False
-                s["video_height"] = None
-                s["video_width"] = None
-                s["device"] = device
-                s["storage_device"] = device
-                s["point_inputs_per_obj"] = {}
-                s["mask_inputs_per_obj"] = {}
-                s["cached_features"] = {}
-                s["constants"] = {}
-                s["obj_id_to_idx"] = OrderedDict()
-                s["obj_idx_to_id"] = OrderedDict()
-                s["obj_ids"] = []
-                s["output_dict"] = {
-                    "cond_frame_outputs": {},
-                    "non_cond_frame_outputs": {},
-                }
-                s["output_dict_per_obj"] = {}
-                s["temp_output_dict_per_obj"] = {}
-                s["consolidated_frame_inds"] = {
-                    "cond_frame_outputs": set(),
-                    "non_cond_frame_outputs": set(),
-                }
-                s["tracking_has_started"] = False
-                s["frames_already_tracked"] = {}
-                s["frames_tracked_per_obj"] = {}
-                return s
+            def _prep_mask(self, mask_np):
+                """uint8 HxW mask → (1, 1, H', W') int tensor on device,
+                resized to match the prepared image."""
+                if mask_np.shape != (self.input_h, self.input_w):
+                    mask_np = cv2.resize(
+                        mask_np.astype(np.uint8),
+                        (self.input_w, self.input_h),
+                        interpolation=cv2.INTER_NEAREST)
+                t = (torch.from_numpy(mask_np.astype(np.int64))
+                     .unsqueeze(0).unsqueeze(0).to(self.device).float())
+                return t
 
             @torch.inference_mode()
             def initialize(self, image, init_mask=None, bbox=None):
-                """Seed the tracker on frame 0. Either init_mask
-                (HxW uint8) or bbox ([x, y, w, h]) must be provided."""
+                """Seed AOT on frame 0. Either init_mask (HxW uint8)
+                or bbox ([x, y, w, h]) must be provided. Bbox is
+                converted to a filled rectangle mask — AOT refines
+                the silhouette within a few frames via memory
+                attention. Best results come from a clean mask."""
                 self.frame_index = 0
-                self.img_width = image.width
-                self.img_height = image.height
-                self.inference_state = self._new_state()
-                self.inference_state["video_height"] = image.height
-                self.inference_state["video_width"] = image.width
-                self.inference_state["images"][0] = self._prepare_image(image)
-                self.inference_state["num_frames"] = 1
-                self.predictor.reset_state(self.inference_state)
-                self.predictor._get_image_feature(
-                    self.inference_state, frame_idx=0, batch_size=1)
-                # EdgeTAM's appearance head locks more reliably on a
-                # dense bbox prompt than a sparse depth-filtered mask
-                # (a 32 × 93 person box at 5 m only had ~655 mask px,
-                # ~22% of the bbox area, which collapsed to 0 px after
-                # one propagation step). Prefer bbox when available and
-                # fall back to mask only if no bbox was supplied.
-                if bbox is not None:
-                    x, y, w, h = bbox  # xywh
-                    box = np.array([x, y, x + w, y + h], dtype=np.float32)
-                    _, _, out_logits = self.predictor.add_new_points_or_box(
-                        inference_state=self.inference_state,
-                        frame_idx=0, obj_id=0, box=box)
-                elif init_mask is not None:
-                    _, _, out_logits = self.predictor.add_new_mask(
-                        inference_state=self.inference_state,
-                        frame_idx=0, obj_id=0, mask=init_mask)
+                self.video_w = image.width
+                self.video_h = image.height
+                self.engine.restart_engine()
+
+                if init_mask is None:
+                    if bbox is None:
+                        raise ValueError(
+                            "AOT init: neither bbox nor init_mask provided")
+                    x, y, w, h = [int(v) for v in bbox]
+                    init_mask = np.zeros(
+                        (self.video_h, self.video_w), dtype=np.uint8)
+                    x1, y1 = max(0, x), max(0, y)
+                    x2 = min(self.video_w, x + w)
+                    y2 = min(self.video_h, y + h)
+                    init_mask[y1:y2, x1:x2] = 1
                 else:
-                    raise ValueError(
-                        "EdgeTAM init: neither bbox nor init_mask provided")
-                m = (out_logits[0, 0] > 0).float().cpu().numpy().astype(np.uint8)
-                # Drop the prepared image now that features are cached.
-                self.inference_state["images"].pop(0, None)
-                return {"pred_mask": m}
+                    init_mask = (init_mask > 0).astype(np.uint8)
+
+                img_t = self._prep_image(image)
+                mask_t = self._prep_mask(init_mask)
+                self.engine.add_reference_frame(
+                    img_t, mask_t, obj_nums=[1], frame_step=0)
+
+                # Reset the centroid history so frame-0 selection
+                # is "biggest valid blob" (no last_centroid to compare).
+                self._last_centroid_uv = None
+
+                # Decode at the video resolution so the published mask
+                # matches camera_info; the BT projection assumes that.
+                logit = self.engine.decode_current_logits(
+                    (self.video_h, self.video_w))
+                m, cuv = self._logit_to_result(logit)
+                return {"pred_mask": m, "centroid_uv": cuv}
 
             @torch.inference_mode()
             def track(self, image, init=False):
-                """Advance one frame. EdgeTAM batches internally, so we
-                store the prepared image as 3D (C,H,W) — feeding 4D
-                turns the conv2d into a 5D crash."""
-                if not init:
-                    self.frame_index += 1
-                    self.inference_state["num_frames"] += 1
-                self.inference_state["images"][self.frame_index] = (
-                    self._prepare_image(image))
-                m = None
-                for out in self.predictor.propagate_in_video(
-                        self.inference_state,
-                        start_frame_idx=self.frame_index,
-                        max_frame_num_to_track=0):
-                    out_logits = out[2]
-                    m = (out_logits[0, 0] > 0).float().cpu().numpy().astype(np.uint8)
-                # Free the prepared image; cached features remain for
-                # the conditioning lookup, identical to DAM4SAM's flow.
-                self.inference_state["images"].pop(self.frame_index, None)
-                if m is None:
+                """Advance one frame; AOT keeps its own memory state."""
+                if init:
+                    return self.initialize(image)
+                self.frame_index += 1
+                img_t = self._prep_image(image)
+                self.engine.match_propogate_one_frame(img_t)
+                logit = self.engine.decode_current_logits(
+                    (self.video_h, self.video_w))
+                m, cuv = self._logit_to_result(logit)
+                if m is None or m.size == 0:
                     m = np.zeros(
-                        (self.img_height, self.img_width), dtype=np.uint8)
-                return {"pred_mask": m}
+                        (self.video_h, self.video_w), dtype=np.uint8)
+                    cuv = None
+                return {"pred_mask": m, "centroid_uv": cuv}
 
-        return _EdgeTAMStreamingTracker()
+            def _logit_to_result(self, logit):
+                """Decode AOT logits into (mask, centroid_uv).
+
+                Three stacked improvements over plain `argmax` + geometric
+                centroid:
+
+                  1. Probability-weighted centroid. The geometric centre
+                     of a thresholded binary mask treats every pixel as
+                     equal — a few drifty pixels at the boundary shift
+                     it frame-to-frame. Weighting by per-pixel fg_prob
+                     pins the centroid on the high-confidence core
+                     (head/torso) and ignores the noisy fringe.
+                  2. Blob selection by proximity to last_centroid.
+                     When multiple blobs survive the area threshold
+                     (head + torso + a stray noise blob), picking the
+                     largest can swing focus between them. Picking the
+                     one closest to the previous centroid preserves
+                     temporal continuity.
+                  3. EMA smoothing on the published centroid, with
+                     blend factor scaled by the chosen blob's area
+                     (high-confidence detection → trust new value;
+                     small/uncertain → move slowly). This is the
+                     "last_seen weighted by recency + confidence"
+                     pattern, but done in the tracker so we don't
+                     need to touch the 2D project's BT.
+                """
+                presence    = float(os.environ.get("AOT_PRESENCE_THRESH", "0.5"))
+                min_blob    = int(  os.environ.get("AOT_MIN_BLOB_PX",      "200"))
+                normal_blob = float(os.environ.get("AOT_NORMAL_BLOB_PX",   "5000"))
+                alpha_min   = float(os.environ.get("AOT_EMA_ALPHA_MIN",    "0.2"))
+                alpha_max   = float(os.environ.get("AOT_EMA_ALPHA_MAX",    "0.9"))
+
+                prob = torch.softmax(logit, dim=1)
+                fg_prob_t = prob[0, 1]                      # (H, W) on device
+                binary_t  = fg_prob_t > presence
+
+                H, W = fg_prob_t.shape
+                if not binary_t.any():
+                    return np.zeros((H, W), dtype=np.uint8), None
+
+                binary_np = binary_t.cpu().numpy().astype(np.uint8)
+                fg_prob_np = fg_prob_t.cpu().numpy()
+
+                n_cc, labels, stats, _ = cv2.connectedComponentsWithStats(
+                    binary_np, connectivity=8)
+                if n_cc <= 1:
+                    return np.zeros_like(binary_np), None
+
+                # stats columns: LEFT TOP WIDTH HEIGHT AREA; index 0 is
+                # the background. Compute per-blob bbox centre as a
+                # cheap proxy for blob centroid for the proximity check.
+                stats_blobs = stats[1:]
+                areas = stats_blobs[:, cv2.CC_STAT_AREA]
+                bcx = stats_blobs[:, cv2.CC_STAT_LEFT] + stats_blobs[:, cv2.CC_STAT_WIDTH]  / 2.0
+                bcy = stats_blobs[:, cv2.CC_STAT_TOP]  + stats_blobs[:, cv2.CC_STAT_HEIGHT] / 2.0
+
+                valid = areas >= min_blob
+                if not valid.any():
+                    return np.zeros_like(binary_np), None
+
+                # Pick the blob: closest to last centroid if we have
+                # one (preserves identity through dual-blob frames),
+                # otherwise the largest valid blob.
+                if self._last_centroid_uv is not None:
+                    lcx, lcy = self._last_centroid_uv
+                    dists = np.hypot(bcx - lcx, bcy - lcy)
+                    dists[~valid] = np.inf
+                    chosen = int(np.argmin(dists))
+                else:
+                    areas_v = areas.astype(np.float64)
+                    areas_v[~valid] = -1.0
+                    chosen = int(np.argmax(areas_v))
+
+                chosen_label = chosen + 1   # +1 because we skipped background
+                mask = (labels == chosen_label).astype(np.uint8)
+
+                # Prob-weighted centroid within the chosen blob.
+                ys, xs = np.where(mask > 0)
+                w = fg_prob_np[ys, xs]
+                wsum = float(w.sum())
+                if wsum <= 0.0:
+                    return np.zeros_like(binary_np), None
+                cx_now = float((xs * w).sum() / wsum)
+                cy_now = float((ys * w).sum() / wsum)
+
+                # EMA: trust new value more when the blob is bigger.
+                # area at "normal" detection distance maps to alpha ≈ 1;
+                # small/sparse blobs blend in slowly so a single noisy
+                # frame can't yank the published centroid across the
+                # image.
+                blob_area = float(areas[chosen])
+                alpha = float(np.clip(
+                    blob_area / max(normal_blob, 1.0), alpha_min, alpha_max))
+                if self._last_centroid_uv is not None:
+                    lcx, lcy = self._last_centroid_uv
+                    cx_pub = alpha * cx_now + (1.0 - alpha) * lcx
+                    cy_pub = alpha * cy_now + (1.0 - alpha) * lcy
+                else:
+                    cx_pub, cy_pub = cx_now, cy_now
+
+                self._last_centroid_uv = (cx_pub, cy_pub)
+                return mask, (cx_pub, cy_pub)
+
+        return _AOTStreamingTracker()
 
     def _snapshot_latest_blocking(
         self,
@@ -932,7 +1294,11 @@ class EdgeTAMTracker(Node):
             time.sleep(0.005)
         return None, None, None, None
 
-    def _make_result(self, mask_np: np.ndarray) -> TrackResult:
+    def _make_result(
+        self,
+        mask_np: np.ndarray,
+        centroid_uv: Optional[Tuple[float, float]] = None,
+    ) -> TrackResult:
         coords = np.argwhere(mask_np)
         h, w = mask_np.shape
         min_area = max(
@@ -941,8 +1307,15 @@ class EdgeTAMTracker(Node):
             return TrackResult(
                 mask=None, confidence=0.0,
                 centroid_uv=None, is_visible=False)
-        v = float(coords[:, 0].mean())
-        u = float(coords[:, 1].mean())
+        if centroid_uv is not None:
+            # Prefer the streaming wrapper's smart centroid
+            # (prob-weighted + EMA across frames). Falling back to the
+            # geometric mean gives a noisier signal that jumps with
+            # fringe pixels — see _logit_to_result in the AOT wrapper.
+            u, v = centroid_uv
+        else:
+            v = float(coords[:, 0].mean())
+            u = float(coords[:, 1].mean())
         area_ratio = len(coords) / float(h * w)
         conf = float(min(1.0, area_ratio * 50.0))
         return TrackResult(
@@ -1083,7 +1456,7 @@ class EdgeTAMTracker(Node):
 
     # ------------------------------------------------------------------
     def _publish_overlay(self, rgb: np.ndarray, result, frame_idx: int) -> None:
-        """RGB + tinted mask + centroid dot + status text → /follower/camera/edgetam_overlay."""
+        """RGB + tinted mask + centroid dot + status text → /follower/camera/aot_overlay."""
         vis = rgb.copy()
         h, w = vis.shape[:2]
 
@@ -1271,7 +1644,7 @@ class EdgeTAMTracker(Node):
 
 def main() -> None:
     rclpy.init()
-    node = EdgeTAMTracker()
+    node = AOTTracker()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

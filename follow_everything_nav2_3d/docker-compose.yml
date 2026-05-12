@@ -6,7 +6,11 @@ services:
     network_mode: host
     ipc: host
     privileged: true
-    runtime: nvidia
+    # `runtime: nvidia` (legacy) removed — the modern path is via the
+    # deploy.resources.reservations.devices block below, which docker
+    # compose translates into the `--gpus all` flag the daemon
+    # understands by default (no daemon.json runtimes registration
+    # needed). This avoids "unknown or invalid runtime name: nvidia".
     environment:
       - DISPLAY=${DISPLAY}
       - QT_X11_NO_MITSHM=1
@@ -37,6 +41,19 @@ services:
       # drop-in `sam2` package with build_sam2_video_predictor that takes
       # configs/edgetam.yaml + checkpoints/edgetam.pt.
       - ../EdgeTAM:/opt/EdgeTAM:ro
+      # AOT-benchmark (yoxu515/aot-benchmark) source. We mount it so we
+      # can edit tools/demo.py + networks/* without rebuilding the image.
+      - ../aot-benchmark:/opt/aot-benchmark:ro
+      # Host CUDA toolkit (CUDA 13.0 dev) — mounted read-only so we
+      # don't have to apt-install ~500 MB of nvcc + cudart-dev +
+      # libraries-dev inside the image. Required by
+      # spatial_correlation_sampler at install time. CUDA_HOME, PATH,
+      # and LD_LIBRARY_PATH are baked into the Dockerfile pointing at
+      # this mount.
+      - /usr/local/cuda-13.0:/usr/local/cuda-13.0:ro
+      # Persistent torch.hub cache (Cutie shares this; AOT also pulls
+      # ImageNet backbones via torch.hub on first run).
+      - ~/.cache/torch:/root/.cache/torch
       - ../yolo11m.pt:/opt/yolo11m.pt:ro
     working_dir: /ws
     stdin_open: true

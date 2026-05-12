@@ -2,7 +2,7 @@
 
 No behavior tree, no pedestrians, no obstacles, no Nav2 — just consumes the
 body-frame leader detection on /follower/camera/detections (whichever source
-the launch args wire there: oracle in dev, DAM4SAM in primary mode) and
+the launch args wire there: oracle in dev, EdgeTAM in primary mode) and
 drives /follower/cmd_vel to keep ~TARGET_DIST metres behind the leader.
 
 The follow_everything_nav2 project has a much richer BT-based follower; we'll
@@ -79,7 +79,7 @@ class SimpleFollower(Node):
             self._last_detect_t = time.time()
             self._leader_seen += 1
         else:
-            # Latest oracle/DAM4SAM frame doesn't see the leader.
+            # Latest oracle/EdgeTAM frame doesn't see the leader.
             self._last_xy = None
             self._last_detect_t = None
 

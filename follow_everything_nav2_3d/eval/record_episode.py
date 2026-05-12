@@ -7,13 +7,13 @@ Usage (inside the container, from /ws):
     python3 eval/record_episode.py [duration_sec] [detection_source]
 
   duration_sec      defaults to 30
-  detection_source  defaults to oracle  (also accepts dam4sam)
+  detection_source  defaults to oracle  (also accepts edgetam)
 
 Produces:
     results/logs/ep_<unix_ts>_empty_0/
         world.log     # gz Fortress + ros_gz_bridges
         leader.log    # oracle_camera (knows the leader's true pose)
-        follower.log  # dam4sam_tracker + follow_everything_follower (BT)
+        follower.log  # edgetam_tracker + follow_everything_follower (BT)
 
 Bypasses `ros2 launch` so each conceptual subsystem gets its own log file.
 """
@@ -119,7 +119,7 @@ spawn("world", [
 #    perception system races a moving target it hasn't locked onto yet.
 # ---------------------------------------------------------------------------
 oracle_cmd = ["python3", "-u", f"{WS}/sim/python/oracle_camera.py"]
-if SRC == "dam4sam":
+if SRC == "edgetam":
     oracle_cmd += [
         "--ros-args", "-r",
         "/follower/camera/detections:=/follower/camera/detections_oracle",
@@ -156,17 +156,41 @@ p = subprocess.Popen(
 procs.append(("snapshots", p))
 
 # ---------------------------------------------------------------------------
-# 3) FOLLOWER: DAM4SAM tracker + the BT-based follow_everything_follower.
+# 3) FOLLOWER: EdgeTAM tracker + the BT-based follow_everything_follower.
 # ---------------------------------------------------------------------------
-tracker_cmd = ["python3", "-u", f"{WS}/follower_pkg/python/edgetam_tracker.py"]
-if SRC == "dam4sam":
-    # SRC name kept for backwards compat; the tracker is now EdgeTAM
-    # (DAM4SAM stripped). The remap takes the tracker output from
-    # /follower/camera/detections_dam4sam over to /follower/camera/detections.
+# Tracker selection. TRACKER_KIND env var picks edgetam (default)
+# or aot; the two scripts share a streaming contract via remap.
+TRACKER_KIND = os.environ.get("TRACKER_KIND", "edgetam")
+if TRACKER_KIND == "aot":
+    tracker_script  = f"{WS}/follower_pkg/python/aot_tracker.py"
+    tracker_topic   = "/follower/camera/detections_aot"
+    INIT_READY_MARKER = "AOT init: mask shape="
+else:
+    tracker_script  = f"{WS}/follower_pkg/python/edgetam_tracker.py"
+    tracker_topic   = "/follower/camera/detections_edgetam"
+    INIT_READY_MARKER = "EdgeTAM init: mask shape="
+
+tracker_cmd = ["python3", "-u", tracker_script]
+if SRC == "edgetam":
+    # SRC name kept for backwards compat — it means "tracker drives the
+    # contract topic." Remap source depends on which tracker is active.
     tracker_cmd += [
         "--ros-args", "-r",
-        "/follower/camera/detections_dam4sam:=/follower/camera/detections",
+        f"{tracker_topic}:=/follower/camera/detections",
     ]
+# CPU pinning. The AOT pure-PyTorch fallback can saturate a CPU core
+# and starve the BT's 20 Hz tick — visible as choppy follow behavior
+# in heavy maps (forest, cluttered). Pin the tracker to a subset of
+# cores via TRACKER_TASKSET_CORES (comma-separated cgroup mask, e.g.
+# "0,1"); the BT picks up the complement via FOLLOWER_TASKSET_CORES.
+# Both default to unpinned (no taskset wrapper) so this only kicks
+# in when explicitly requested. Needs `privileged: true` on compose
+# (already set) for the BT's negative-nice case too.
+tracker_cores  = os.environ.get("TRACKER_TASKSET_CORES",  "").strip()
+follower_cores = os.environ.get("FOLLOWER_TASKSET_CORES", "").strip()
+if tracker_cores:
+    tracker_cmd = ["taskset", "-c", tracker_cores] + tracker_cmd
+    print(f"Pinning tracker to cores {tracker_cores}")
 # Forward the episode log directory so the tracker can dump init RGB +
 # the first few propagated frames for offline inspection.
 tracker_env = dict(os.environ)
@@ -174,14 +198,10 @@ tracker_env["EP_LOG_DIR"] = str(DIR)
 spawn("follower", tracker_cmd, env=tracker_env)
 
 # Block until the tracker has both (a) finished building the predictor
-# (~30 s for EdgeTAM cold start) AND (b) run its first init pass on the
-# stationary leader. The init line only appears once the tracker has
-# received a camera frame + oracle bbox AND propagated them through its
-# first add_new_points_or_box call. While we wait the leader is still
-# (we haven't spawned leader_controller yet), so the bbox EdgeTAM sees
-# is from the spawn pose, not a moving target. No wall-clock fallback —
-# if the build doesn't finish there's no point continuing.
-INIT_READY_MARKER = "DAM4SAM init: mask shape="
+# (~30 s cold for EdgeTAM, ~5 s for AOT) AND (b) run its first init
+# pass on the stationary leader. The init line only appears once the
+# tracker has received a camera frame + oracle bbox AND processed it.
+# INIT_READY_MARKER is set above based on TRACKER_KIND.
 print(f"Waiting for tracker init ({INIT_READY_MARKER!r})...")
 _t0 = time.time()
 _follower_log = DIR / "follower.log"
@@ -213,10 +233,14 @@ if MAP == "empty":
     fenv.setdefault("SIM_MAP", "/dev/null")
 else:
     fenv["SIM_MAP"] = f"/opt/follow_everything_nav2/sim/maps/{MAP}.txt"
-spawn("follower", [
+follower_cmd = [
     "python3", "-u",
     "/opt/follow_everything_nav2/follower_pkg/python/follow_everything_follower.py",
-], env=fenv)
+]
+if follower_cores:
+    follower_cmd = ["taskset", "-c", follower_cores] + follower_cmd
+    print(f"Pinning BT/Nav2 follower to cores {follower_cores}")
+spawn("follower", follower_cmd, env=fenv)
 
 # ---------------------------------------------------------------------------
 # 4) Run for DUR seconds, then shut down cleanly.

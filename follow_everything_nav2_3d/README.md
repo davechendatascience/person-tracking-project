@@ -1,6 +1,6 @@
 # follow_everything_nav2_3d
 
-3D Gazebo port of [`follow_everything_nav2`](../follow_everything_nav2/), with [DAM4SAM](../DAM4SAM/) as the real perception backend (replacing the oracle camera detector). Built incrementally — each phase keeps a working demo.
+3D Gazebo port of [`follow_everything_nav2`](../follow_everything_nav2/), with [EdgeTAM](../EdgeTAM/) as the real perception backend (replacing the oracle camera detector). Built incrementally — each phase keeps a working demo. Earlier phases used DAM4SAM; it was swapped out for EdgeTAM after Phase 5 (see `Post-Phase 5` below).
 
 The topic contract is frozen across phases (matches `follow_everything_nav2`):
 
@@ -19,7 +19,8 @@ The topic contract is frozen across phases (matches `follow_everything_nav2`):
 - [x] Phase 4a — RGB-D camera + DAM4SAM tracker skeleton publishing `/follower/camera/detections_dam4sam` (no-op detector).
 - [x] Phase 4b-i — CUDA torch + DAM4SAM/SAM2/YOLO Python deps in the image, GPU runtime + parent-repo mounts in compose.
 - [x] Phase 4b-ii — real `SAM2Tracker` wired into `dam4sam_tracker.py`: YOLO bootstrap + frame-by-frame mask + depth back-projection → body-frame `(x, y)`.
-- [x] **Phase 5** — DAM4SAM is primary on `/follower/camera/detections`; minimal P-controller `simple_follower.py` chases the leader end-to-end. *(this commit)*
+- [x] **Phase 5** — DAM4SAM is primary on `/follower/camera/detections`; minimal P-controller `simple_follower.py` chases the leader end-to-end.
+- [x] **Post-Phase 5** — swapped DAM4SAM → EdgeTAM (lighter SAM2-compatible model, ~20 Hz vs ~3 Hz; DRM dropped — BT-side SweepRecover handles brief mask losses). Tracker renamed `dam4sam_tracker.py` → `edgetam_tracker.py`; topic renamed `detections_dam4sam` → `detections_edgetam`. *(current)*
 - [ ] Phase 6 — odometry noise (EKF), latency, TF cleanup.
 
 ## Layout (mirrors [`follow_everything_nav2/`](../follow_everything_nav2/))
@@ -33,7 +34,7 @@ follow_everything_nav2_3d/
 │   ├── python/oracle_camera.py
 │   └── launch/empty_bringup.launch.py
 └── follower_pkg/                 # follower-side: tracker, BT, follower launch
-    ├── python/dam4sam_tracker.py
+    ├── python/edgetam_tracker.py
     ├── launch/follower.launch.py
     └── bt_xml/                   # (Phase 5+ behavior tree)
 ```
@@ -55,7 +56,7 @@ URDF: [`sim/urdf/follower.urdf.xacro`](sim/urdf/follower.urdf.xacro).
 
 ## Display / X11 forwarding
 
-Gazebo's GUI, RViz, and the DAM4SAM overlay all need an X server reachable
+Gazebo's GUI, RViz, and the EdgeTAM overlay all need an X server reachable
 from inside the container. [`docker-compose.yml`](docker-compose.yml) mounts
 `/tmp/.X11-unix` and exports `DISPLAY` + `XAUTHORITY` already; what differs
 is how you make the host's X server (or your laptop's) accept connections.
@@ -409,25 +410,26 @@ Known limitations:
 - Depth back-projection assumes the SAM2-internal 1024×1024 resize; that's
   scaled back to the depth resolution in `_project_to_base_link`.
 
-## Phase 5 — DAM4SAM primary + minimal P-controller follower
+## Phase 5 — tracker primary + minimal P-controller follower
 
-DAM4SAM is now the primary detection source on `/follower/camera/detections`
-(the topic the follower reads). The oracle is still bridged but moved to
+The tracker (EdgeTAM as of Post-Phase 5; DAM4SAM at Phase 5 time) is the
+primary detection source on `/follower/camera/detections` (the topic the
+follower reads). The oracle is still bridged but moved to
 `/follower/camera/detections_oracle` so it can run alongside for comparison.
 
 Switching sources via launch arg:
 
 | invocation                                                                | who drives `/follower/camera/detections`        |
 |---------------------------------------------------------------------------|--------------------------------------------------|
-| `ros2 launch sim/launch/empty_bringup.launch.py` *(default)*              | DAM4SAM (oracle remapped to `_oracle`)           |
-| `ros2 launch sim/launch/empty_bringup.launch.py detection_source:=oracle` | oracle (DAM4SAM stays on `_dam4sam`)             |
+| `ros2 launch sim/launch/empty_bringup.launch.py` *(default)*              | EdgeTAM (oracle remapped to `_oracle`)           |
+| `ros2 launch sim/launch/empty_bringup.launch.py detection_source:=oracle` | oracle (EdgeTAM stays on `_edgetam`)             |
 
 The follower side mirrors the same arg:
 
 | invocation                                                                                    | result                                         |
 |-----------------------------------------------------------------------------------------------|------------------------------------------------|
 | `ros2 launch follower_pkg/launch/follower.launch.py` *(default)*                              | tracker output remapped onto `/detections`     |
-| `ros2 launch follower_pkg/launch/follower.launch.py detection_source:=oracle`                 | tracker stays on `_dam4sam`; follower follows the oracle |
+| `ros2 launch follower_pkg/launch/follower.launch.py detection_source:=oracle`                 | tracker stays on `_edgetam`; follower follows the oracle |
 
 ### `simple_follower.py`
 
@@ -449,20 +451,20 @@ is what we'll wire in once we add obstacles + lost-leader recovery.
 ### Phase 5 acceptance
 
 ```bash
-# t1 — sim + (DAM4SAM-driving) detections + oracle on _oracle
+# t1 — sim + (EdgeTAM-driving) detections + oracle on _oracle
 ros2 launch sim/launch/empty_bringup.launch.py
 
-# t2 — DAM4SAM tracker + simple_follower
+# t2 — EdgeTAM tracker + simple_follower
 docker exec -it follow_everything_nav2_3d-sim-run-XXXXXX bash
 ros2 launch follower_pkg/launch/follower.launch.py
 
 # t3 — verify topics + watch the follower chase
-ros2 topic hz /follower/camera/detections          # DAM4SAM rate (~5 Hz)
+ros2 topic hz /follower/camera/detections          # EdgeTAM rate (~20 Hz)
 ros2 topic hz /follower/camera/detections_oracle   # oracle (~20 Hz)
 ros2 topic echo /follower/cmd_vel --once
 ```
 
-Visually (RViz Image display on `/follower/camera/dam4sam_overlay`): mask
+Visually (RViz Image display on `/follower/camera/edgetam_overlay`): mask
 follows the actor; the green follower disk in Gazebo trails the actor
 around its rectangular patrol, holding ~1.5 m stand-off.
 
@@ -472,7 +474,7 @@ follower behaves identically (same topic contract, just different source).
 ## Recording an evaluation episode
 
 [`eval/record_episode.py`](eval/record_episode.py) launches the full stack
-(gz Fortress + bridges, leader patrol, oracle/DAM4SAM tracker, BT follower,
+(gz Fortress + bridges, leader patrol, oracle/EdgeTAM tracker, BT follower,
 snapshot recorder) for a fixed duration and writes per-process logs +
 top-down snapshots into `results/logs/ep_<unix_ts>_<map>_0/`.
 
@@ -485,7 +487,7 @@ python3 eval/record_episode.py [duration_sec] [detection_source] [map]
 | arg                | values                  | default  |
 |--------------------|-------------------------|----------|
 | `duration_sec`     | integer seconds         | `30`     |
-| `detection_source` | `oracle` \| `dam4sam`   | `oracle` |
+| `detection_source` | `oracle` \| `edgetam`   | `oracle` |
 | `map`              | `empty` \| `cluttered`  | `empty`  |
 
 Examples:
@@ -494,9 +496,97 @@ Examples:
 # 90 s oracle run on the empty map
 python3 eval/record_episode.py 90 oracle empty
 
-# 90 s DAM4SAM (real perception) run on the cluttered map
-python3 eval/record_episode.py 90 dam4sam cluttered
+# 90 s EdgeTAM (real perception) run on the cluttered map
+python3 eval/record_episode.py 90 edgetam cluttered
 ```
+
+### Switching the tracker to AOT/DeAOT
+
+> **Caveat — AOT requires a one-time setup inside the container.**
+>
+> The Docker image does **not** ship the CUDA toolkit or the
+> `spatial_correlation_sampler` CUDA kernel that AOT's matching attention
+> needs for its fast path. Instead:
+>
+> 1. The host's `/usr/local/cuda-13.0` is mounted into the container
+>    read-only via `docker-compose.yml` (matching env vars `CUDA_HOME`,
+>    `PATH`, `LD_LIBRARY_PATH` are set in the Dockerfile pointing at
+>    this mount). The host must therefore have CUDA 13.0 toolkit
+>    installed under that path. Verify:
+>    ```bash
+>    ls /usr/local/cuda-13.0/bin/nvcc   # must exist on the host
+>    ```
+> 2. After `docker compose build` / `docker compose up -d sim`, install
+>    `spatial_correlation_sampler` **once** inside the running container:
+>    ```bash
+>    docker exec follow_everything_nav2_3d \
+>        pip install --no-cache-dir --no-build-isolation spatial-correlation-sampler
+>    docker exec follow_everything_nav2_3d python3 -c \
+>        "from spatial_correlation_sampler import SpatialCorrelationSampler; print('OK')"
+>    ```
+> 3. Bake the install into the image so subsequent `docker compose up`
+>    runs don't need to re-install:
+>    ```bash
+>    docker commit follow_everything_nav2_3d follow_everything_nav2_3d:latest
+>    ```
+>    Note: `docker commit` is overwritten by `docker compose build` —
+>    if you later rebuild the image, repeat steps 2–3.
+>
+> Without the kernel, AOT falls back to a pure-PyTorch implementation
+> that saturates a CPU core and runs ~3–5× slower. The tracker logs
+> `AOT enable_corr (CUDA correlation kernel)=True — fast path` at
+> startup when the kernel is loaded; if it logs `False — pure-PyTorch
+> fallback`, redo step 2.
+
+`record_episode.py` reads the `TRACKER_KIND` env var (`edgetam` default, or
+`aot`). The second positional arg (`edgetam` in the examples above) is a
+legacy name that means "tracker drives the contract topic", not the choice
+of tracker binary — leave it as `edgetam` even when running AOT.
+
+```bash
+# 90 s AOT/DeAOT run on the empty map
+TRACKER_KIND=aot python3 eval/record_episode.py 90 edgetam empty
+
+# 120 s AOT/DeAOT run on cluttered with the larger SwinB-DeAOT-L weights
+TRACKER_KIND=aot AOT_MODEL=swinb_deaotl \
+AOT_CKPT=/opt/aot-benchmark/pretrain_models/SwinB_DeAOTL_PRE_YTB_DAV.pth \
+  python3 eval/record_episode.py 120 edgetam cluttered
+```
+
+AOT-specific env vars (all optional; defaults shown):
+
+| env var                   | default                              | what |
+|---------------------------|--------------------------------------|------|
+| `AOT_MODEL`               | `r50_deaotl`                         | model config under `aot-benchmark/configs/models/` |
+| `AOT_CKPT`                | derived from `AOT_MODEL`             | checkpoint path |
+| `AOT_LT_GAP`              | `5`                                  | write one long-term-memory entry every N frames |
+| `AOT_LT_MAX`              | `80`                                 | hard cap on long-term memory entries |
+| `AOT_LT_BATCH_EVICT_EVERY`| `50`                                 | scheduled eviction cadence (frames); evicts only when bank > `AOT_LT_MAX` |
+| `AOT_LT_KEEP_RATIO`       | `0.8`                                | on eviction, keep newest `AOT_LT_MAX × ratio` entries; rest dropped |
+| `AOT_MAX_LONG_EDGE`       | `800`                                | input resize cap (longer image edge in pixels) |
+| `TRACKER_TASKSET_CORES`   | unset                                | optional cgroup mask for the tracker process (e.g. `"0,1"`) |
+| `FOLLOWER_TASKSET_CORES`  | unset                                | optional cgroup mask for the BT follower |
+
+The defaults are validated on a 1001-frame test clip: stable 5.8 GB
+VRAM and 2.1 % fragmentation at the end of the run, no OOM. See the
+[CUDA OOM = fragmentation first](#) lesson (Claude memory) for the
+underlying reasoning.
+
+### Standalone offline AOT smoke test
+
+For a no-ROS sanity check on a video file:
+
+```bash
+# inside the running sim container, from /ws:
+python3 eval/smoke_tracker_aot.py <input.mp4> [output.mp4]
+
+# pick a different model:
+AOT_MODEL=swinb_deaotl python3 eval/smoke_tracker_aot.py input.mp4 out.mp4
+```
+
+Verifies (a) the CUDA correlation kernel imports (`enable_corr=True`
+log line) and (b) the AOT engine completes the clip with the
+configured memory cap, without ROS / Gazebo overhead.
 
 Output layout:
 
@@ -504,7 +594,7 @@ Output layout:
 results/logs/ep_<ts>_<map>_0/
 ├── world.log        # gz + bridges + world_odom_publisher + lidar_leader_filter
 ├── leader.log       # oracle_camera + leader_controller
-├── follower.log     # dam4sam_tracker + follow_everything_follower (BT)
+├── follower.log     # edgetam_tracker + follow_everything_follower (BT)
 ├── snapshots.log    # snapshot_recorder
 └── snapshots/       # one top-down PNG per second (pose, FOV, A* path, last_seen)
 ```
@@ -514,5 +604,5 @@ If invoked from outside the container, prefix with `docker exec`:
 ```bash
 docker exec <follow_everything_nav2_3d-sim-run-...> bash -lc \
   'source /opt/ros/humble/setup.bash && cd /ws && \
-   python3 eval/record_episode.py 90 dam4sam cluttered'
+   python3 eval/record_episode.py 90 edgetam cluttered'
 ```

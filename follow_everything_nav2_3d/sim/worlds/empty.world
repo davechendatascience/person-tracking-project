@@ -196,7 +196,7 @@
              can't peek over them — earlier mounted at z=1.55 m, just
              above wall tops, which let SAM2 sometimes lock onto the
              leader through what should have been an opaque obstacle.
-             Roughly chest-height of the 1.7 m leader. The dam4sam_tracker
+             Roughly chest-height of the 1.7 m leader. The edgetam_tracker
              CAM_OFFSET_X_BODY / CAM_OFFSET_Z_BODY constants must match. -->
         <sensor name="rgbd_camera" type="rgbd_camera">
           <pose>0.10 0 1.20 0 0 0</pose>
@@ -354,48 +354,34 @@
           </inertia>
         </inertial>
 
-        <!-- Torso. -->
-        <visual name="torso">
-          <pose>0 0 0.85 0 0 0</pose>
-          <geometry><cylinder><radius>0.18</radius><length>1.10</length></cylinder></geometry>
-          <material>
-            <ambient>0.20 0.50 0.90 1</ambient>
-            <diffuse>0.20 0.50 0.90 1</diffuse>
-          </material>
-        </visual>
-        <!-- Bright-yellow vertical stripe on the back of the torso.
-             SAM2 needs a feature that visibly distinguishes the leader
-             from the brown 1.5 m obstacle boxes; a saturated colour the
-             obstacles don't share gives the appearance head a stable
-             handle to lock onto across frames. Sits at body x=-0.18
-             (just outside the torso radius, on the back side). -->
-        <visual name="back_stripe">
-          <pose>-0.18 0 0.85 0 0 0</pose>
-          <geometry><box><size>0.02 0.20 0.80</size></box></geometry>
-          <material>
-            <ambient>1.0 0.85 0.0 1</ambient>
-            <diffuse>1.0 0.85 0.0 1</diffuse>
-          </material>
-        </visual>
-        <!-- Head. -->
-        <visual name="head">
-          <pose>0 0 1.55 0 0 0</pose>
-          <geometry><sphere><radius>0.12</radius></sphere></geometry>
-          <material>
-            <ambient>0.95 0.78 0.65 1</ambient>
-            <diffuse>0.95 0.78 0.65 1</diffuse>
-          </material>
-        </visual>
-        <!-- Legs (single capsule each, easier than 4 cylinders). -->
-        <visual name="left_leg">
-          <pose>0 0.08 0.30 0 0 0</pose>
-          <geometry><cylinder><radius>0.06</radius><length>0.55</length></cylinder></geometry>
-          <material><diffuse>0.10 0.10 0.30 1</diffuse></material>
-        </visual>
-        <visual name="right_leg">
-          <pose>0 -0.08 0.30 0 0 0</pose>
-          <geometry><cylinder><radius>0.06</radius><length>0.55</length></cylinder></geometry>
-          <material><diffuse>0.10 0.10 0.30 1</diffuse></material>
+        <!-- Body visual: Mingfei actor's static "stand" mesh from gz
+             Fortress Fuel (https://fuel.gazebosim.org/1.0/Mingfei/models/actor).
+             We use just the .dae mesh — NOT the <actor>+skin animation
+             rig — so this stays a <model> that VelocityControl can
+             drive. Trade-off: no walking-cycle animation; the figure
+             translates and rotates rigidly. Gain: a real human-shape
+             silhouette with texture, skin/clothing colour ratios, hair,
+             arms — i.e. everything AOT/Cutie/EdgeTAM's appearance head
+             was trained on YT-VOS / DAVIS to recognize as "person."
+             The earlier cylinder+sphere primitives looked enough like
+             cylindrical wall obstacles that AOT's memory attention
+             couldn't reliably distinguish leader from environment.
+             The mesh is pre-cached in the Dockerfile via
+             `ign fuel download` so first launch works offline. -->
+        <visual name="body_mesh">
+          <!-- The Mingfei .dae's local origin is at the mesh's
+               midpoint (~waist), not at the feet — same reason the
+               actor's own model.sdf uses <pose>0 0 1.0 ...>.
+               Raise the visual by 1.0 m so the feet land at the
+               model frame's z=0 (ground). If the figure still hovers
+               or sinks, nudge the z value here. -->
+          <pose>0 0 1.0 0 0 0</pose>
+          <geometry>
+            <mesh>
+              <uri>file:///root/.ignition/fuel/fuel.gazebosim.org/mingfei/models/actor/1/meshes/walk.dae</uri>
+              <scale>1 1 1</scale>
+            </mesh>
+          </geometry>
         </visual>
 
         <!-- Single cylindrical collision approximating the whole body

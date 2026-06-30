@@ -151,6 +151,13 @@ class SAM2AOTMemoryTracker:
                  empty_cache_every: int = 200,
                  amp: str = "bf16",           # "bf16" | "fp16" | "none" — ~2.5x on this HW
                  compile_encoder: bool = True,  # torch.compile the image encoder (~1.4x)
+                 # --- appearance-gated promotion (anti-contamination) ---
+                 promote_appearance_gate: bool = True,  # gate LT writes on obj_ptr identity
+                 appearance_tau: float = 0.65,  # min cos(candidate, trusted ref) to promote
+                 trusted_ref_k: int = 4,        # # early anchors that freeze the trusted ref
+                 drift_floor: float = 0.5,      # cos below this counts toward a drift run
+                 drift_patience: int = 12,      # consecutive low-cos frames -> freeze promotion
+                 collect_telemetry: bool = False,  # record per-frame obj_ptr identity stats
                  verbose: bool = True):
         import torch
         if backbone not in self._BACKBONES:
@@ -182,6 +189,28 @@ class SAM2AOTMemoryTracker:
         self._area_hist: List[int] = []
         self._n_promoted = 0
         self._n_evicted = 0
+        # --- appearance-gated promotion (anti-contamination) ---
+        # Only promote a frame into long-term memory if its obj_ptr identity still
+        # agrees with a *frozen* trusted reference (mean of the first few clean
+        # anchors). Calibrated on two_girls_dance: correct frames score >=0.74,
+        # contaminated/wrong-girl frames <=0.60 even when girl-sized (so the size
+        # gate alone passes them). Anchoring to early clean frames — not the
+        # rolling anchors — is what stops one bad promotion from poisoning the ref.
+        self.promote_appearance_gate = promote_appearance_gate
+        self.appearance_tau = appearance_tau
+        self.trusted_ref_k = trusted_ref_k
+        self.drift_floor = drift_floor
+        self.drift_patience = drift_patience
+        self._trusted_ref = None        # frozen identity reference (normalized)
+        self._ref_ptrs: List = []       # accumulates first trusted_ref_k anchors
+        self._drift_low = 0             # consecutive frames with cos < drift_floor
+        # --- identity telemetry (calibration for appearance-gated promotion) ---
+        # When on, every frame records obj_ptr cosine-to-seed / cosine-to-LT-mean,
+        # centroid, area and the gate decisions. Used to pick promotion thresholds
+        # from data before turning the appearance gate on. Zero cost when off.
+        self.collect_telemetry = collect_telemetry
+        self._telemetry: List[dict] = []
+        self._seed_ptr = None
 
     def _log(self, msg: str) -> None:
         if self.verbose:
@@ -340,6 +369,79 @@ class SAM2AOTMemoryTracker:
         return TrackResult(mask.astype(bool), conf, cuv, True), px
 
     # ------------------------------------------------------------------
+    def _obj_ptr(self, state, frame_idx):
+        """L2-normalized obj_ptr (256-d identity vector) for a frame, or None.
+
+        This is SAM2's per-frame object descriptor; its cosine to the seed is a
+        cheap drift signal — when the track jumps to a distractor the pointer
+        moves toward that distractor's appearance and the cosine drops."""
+        import torch
+        # Frame 0's output (from the box/mask prompt) sits in the per-object /
+        # temp dicts until the first propagate consolidates it into the global
+        # output_dict, so search all of them.
+        entries = []
+        for store in ("cond_frame_outputs", "non_cond_frame_outputs"):
+            entries.append(state["output_dict"].get(store, {}).get(frame_idx))
+        for key in ("output_dict_per_obj", "temp_output_dict_per_obj"):
+            for obj in state.get(key, {}).values():
+                for store in ("cond_frame_outputs", "non_cond_frame_outputs"):
+                    entries.append(obj.get(store, {}).get(frame_idx))
+        for e in entries:
+            if e is not None and e.get("obj_ptr") is not None:
+                p = e["obj_ptr"].detach().float().reshape(-1)
+                n = torch.linalg.norm(p)
+                return (p / n) if n > 0 else p
+        return None
+
+    def _appearance_cos(self, state, frame_idx):
+        """cos(candidate obj_ptr, frozen trusted reference), or None if either
+        the reference isn't established yet or the frame has no obj_ptr."""
+        if self._trusted_ref is None:
+            return None
+        ptr = self._obj_ptr(state, frame_idx)
+        if ptr is None:
+            return None
+        return float((ptr * self._trusted_ref).sum())
+
+    def _update_trusted_ref(self, state, frame_idx):
+        """Build the trusted identity reference from the first trusted_ref_k
+        promoted (early, clean) anchors, then freeze it."""
+        if self._trusted_ref is not None:
+            return
+        ptr = self._obj_ptr(state, frame_idx)
+        if ptr is not None:
+            self._ref_ptrs.append(ptr)
+        if len(self._ref_ptrs) >= self.trusted_ref_k:
+            import torch
+            m = torch.stack(self._ref_ptrs).mean(0)
+            n = torch.linalg.norm(m)
+            self._trusted_ref = (m / n) if n > 0 else m
+            self._log(f"trusted identity reference frozen from "
+                      f"{len(self._ref_ptrs)} anchors")
+
+    def _record_telemetry(self, state, frame_idx, res, px, size_gate, promoted):
+        """Log per-frame identity stats for promotion-threshold calibration."""
+        import torch
+        ptr = self._obj_ptr(state, frame_idx)
+        cos_seed = cos_lt = float("nan")
+        if ptr is not None:
+            if self._seed_ptr is not None:
+                cos_seed = float((ptr * self._seed_ptr).sum())
+            # mean cosine to the *other* long-term anchors (exclude self).
+            anchors = [self._obj_ptr(state, k) for k in self._promoted
+                       if k != frame_idx]
+            anchors = [a for a in anchors if a is not None]
+            if anchors:
+                cos_lt = float(torch.stack([(ptr * a).sum()
+                                            for a in anchors]).mean())
+        cx, cy = (res.centroid_uv if res.centroid_uv is not None
+                  else (float("nan"), float("nan")))
+        self._telemetry.append(dict(
+            frame=frame_idx, cos_seed=cos_seed, cos_lt=cos_lt,
+            cx=cx, cy=cy, area=px, visible=bool(res.is_visible),
+            size_gate=bool(size_gate), promoted=bool(promoted)))
+
+    # ------------------------------------------------------------------
     def track_sequence(self,
                        frames: Iterable[np.ndarray],
                        initial_bbox: Optional[np.ndarray] = None,
@@ -356,6 +458,11 @@ class SAM2AOTMemoryTracker:
         self._build()
         self._promoted.clear()
         self._area_hist.clear()
+        self._telemetry.clear()
+        self._seed_ptr = None
+        self._trusted_ref = None
+        self._ref_ptrs.clear()
+        self._drift_low = 0
         self._n_promoted = self._n_evicted = 0
         predictor = self._predictor
         state = None
@@ -390,6 +497,10 @@ class SAM2AOTMemoryTracker:
                     state["images"].pop(0, None)
                     res, px = self._result(logit, h, w)
                     self._area_hist.append(px)
+                    # Seed identity anchor — the clean reference for drift checks.
+                    self._seed_ptr = self._obj_ptr(state, 0)
+                    if self.collect_telemetry:
+                        self._record_telemetry(state, 0, res, px, False, False)
                     yield 0, res
                     continue
 
@@ -407,12 +518,44 @@ class SAM2AOTMemoryTracker:
                 self._area_hist.append(px)
 
                 # ---- AOT long/short-term memory management ----
-                if self._should_promote(frame_idx, px, h * w):
-                    self._promote(state, frame_idx)
-                    self._evict_long_term(state)
-                    self._log(f"f{frame_idx}: promote→LT "
-                              f"(LT={len(self._promoted)}/{self.lt_max}, "
-                              f"px={px}, evicted={self._n_evicted})")
+                size_gate = self._should_promote(frame_idx, px, h * w)
+
+                # Drift run: count consecutive frames whose identity has fallen
+                # away from the trusted reference (used to freeze promotion when
+                # the track is sustainedly off, e.g. a long distractor solo).
+                cos_ref = self._appearance_cos(state, frame_idx)
+                if cos_ref is not None:
+                    self._drift_low = (self._drift_low + 1
+                                       if cos_ref < self.drift_floor else 0)
+
+                promoted = False
+                if size_gate:
+                    if not self.promote_appearance_gate or self._trusted_ref is None:
+                        # Gate off, or still bootstrapping the trusted reference
+                        # from early (clean) anchors — promote on the size gate.
+                        promoted = True
+                    else:
+                        # Identity gate: agree with the frozen reference AND not
+                        # be in the middle of a sustained drift run.
+                        promoted = (cos_ref is not None
+                                    and cos_ref >= self.appearance_tau
+                                    and self._drift_low < self.drift_patience)
+                    if promoted:
+                        self._promote(state, frame_idx)
+                        self._evict_long_term(state)
+                        if self.promote_appearance_gate:
+                            self._update_trusted_ref(state, frame_idx)
+                        self._log(f"f{frame_idx}: promote→LT "
+                                  f"(LT={len(self._promoted)}/{self.lt_max}, "
+                                  f"px={px}, cos={cos_ref if cos_ref is not None else float('nan'):.3f}, "
+                                  f"evicted={self._n_evicted})")
+                    elif size_gate:
+                        self._log(f"f{frame_idx}: REJECT promote "
+                                  f"(cos={cos_ref if cos_ref is not None else float('nan'):.3f}"
+                                  f" < tau={self.appearance_tau}, drift={self._drift_low})")
+                if self.collect_telemetry:
+                    self._record_telemetry(state, frame_idx, res, px,
+                                           size_gate, promoted)
                 self._evict_short_term(state, frame_idx)
 
                 yield frame_idx, res

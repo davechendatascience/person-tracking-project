@@ -9,7 +9,7 @@ repointed to person targeting.
 ## Pieces
 | file | what |
 |---|---|
-| `speech_to_text.py` | `SpeechToText`: mic → energy VAD → Silero VAD → faster-whisper → text (zh/en). Ported verbatim. |
+| `speech_to_text.py` | `SpeechToText`: mic → energy VAD → Silero VAD → **SenseVoiceSmall** (CJK ASR, default) → text. `STT_ENGINE=whisper` switches back to faster-whisper. |
 | `target_resolver.py` | `resolve_target(frame_rgb, description) -> [x1,y1,x2,y2]`: multimodal LLM grounds the description to a person bbox. |
 | `app.py` | end-to-end CLI: frame + (typed/spoken) description → bbox drawn on an image. |
 
@@ -20,7 +20,23 @@ pip install -r stt/requirements.txt
 # voice only: sudo apt-get install -y portaudio19-dev   (needed by pyaudio)
 ```
 
-## Backend
+## Speech engine (`--voice`)
+Default is **SenseVoiceSmall** (Alibaba FunAudioLLM, via `funasr`) — a CJK ASR
+covering **zh / yue / ja / ko / en** with auto language detection. It runs on
+**torch + CUDA**, so it actually uses the GPU on this box; faster-whisper can't
+(its ctranslate2 has no aarch64/CUDA wheel and falls back to CPU). The ~900 MB
+model is pulled from ModelScope on first use; inference is ~0.1–0.4 s/command.
+
+```bash
+# default — SenseVoice on GPU, CJK auto-detect
+python -m stt.app --video ... --frame 0 --voice
+# fall back to faster-whisper (Chinese), or pin SenseVoice language:
+export STT_ENGINE=whisper
+export STT_ENGINE=sensevoice STT_SENSEVOICE_LANG=zh   # force Chinese only
+```
+zh/yue output is converted to Traditional Chinese (OpenCC `s2twp`); ja/ko/en pass through.
+
+## Multimodal-LLM backend
 Default is **local Qwen2-VL-2B-Instruct** via transformers — no API key, no
 server, runs on the GPU (`STT_BACKEND=hf`). The model is pulled from the HF cache
 on first use. Verified: resolves English and Chinese descriptions to a person

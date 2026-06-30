@@ -10,7 +10,15 @@ accelerate
 openai>=1.0
 
 # --- speech-to-text (only needed for --voice) ---
-# faster-whisper bundles Silero VAD.
+# Default engine "sensevoice": Alibaba FunAudioLLM SenseVoiceSmall — a CJK ASR
+# (zh/yue/ja/ko/en) that runs on torch+CUDA, so it uses the GPU on this box
+# (unlike faster-whisper, whose ctranslate2 has no aarch64/CUDA wheel here and
+# falls back to CPU). funasr imports torchaudio; install a build matching torch:
+#   pip install funasr
+#   pip install torchaudio --no-deps   # must match the installed torch version
+funasr>=1.3
+# faster-whisper is kept as the fallback engine (STT_ENGINE=whisper) and still
+# provides the Silero VAD trim used by both engines.
 faster-whisper>=1.0
 opencc-python-reimplemented>=0.1.7   # simplified -> traditional Chinese
 # pyaudio needs the system PortAudio lib first:  sudo apt-get install portaudio19-dev

@@ -1,21 +1,37 @@
 #!/usr/bin/env python3
-"""Speech-to-text: mic -> energy VAD -> Silero VAD trim -> faster-whisper -> text.
+"""Speech-to-text: mic -> energy VAD -> Silero VAD trim -> ASR -> text.
 
-Ported verbatim from wardmate_ws/src/stt/scripts/main_stt.py. Self-contained
+ASR engine is selectable via ``STT_ENGINE``:
+  * ``sensevoice`` (default) — Alibaba FunAudioLLM SenseVoiceSmall, a CJK ASR
+    (zh/yue/ja/ko/en) running on torch+CUDA, so it uses the GPU on this box.
+  * ``whisper`` — the original faster-whisper (ctranslate2 has no aarch64/CUDA
+    wheel here, so it falls back to CPU).
+
+Originally ported from wardmate_ws/src/stt/scripts/main_stt.py. Self-contained
 (no ROS): a reusable ``SpeechToText`` that calls ``on_text(text, lang)`` for
 every recognised command. Used here to capture the spoken description of who to
 track (e.g. 「追蹤穿紅色衣服的人」 / "track the person in the red shirt").
 """
 import os
+import re
 import threading
 import time
 
 import numpy as np
 
+# --- 引擎選擇 ---
+# sensevoice：阿里 FunAudioLLM 的 SenseVoiceSmall（CJK ASR，跑在 torch+CUDA，
+#             本機可真正用上 GPU）。whisper：原本的 faster-whisper（此平台的
+#             ctranslate2 無 CUDA wheel，會退回 CPU）。
+STT_ENGINE = os.environ.get("STT_ENGINE", "sensevoice").lower()
+
 # --- 基礎配置（可用環境變數覆寫）---
-MODEL_SIZE = os.environ.get("STT_MODEL", "large-v3-turbo")
+MODEL_SIZE = os.environ.get("STT_MODEL", "large-v3-turbo")  # whisper 用
+SENSEVOICE_MODEL = os.environ.get("STT_SENSEVOICE_MODEL", "iic/SenseVoiceSmall")
 DEVICE = os.environ.get("STT_DEVICE", "cuda")        # 自動退回 CPU（見 load_model）
 COMPUTE_TYPE = os.environ.get("STT_COMPUTE", "int8_float16")
+# SenseVoice 的語言：auto 讓它自動分辨 CJK（zh/yue/ja/ko/en）。
+SENSEVOICE_LANGUAGE = os.environ.get("STT_SENSEVOICE_LANG", "auto")
 
 RATE = 16000
 CHUNK = 1600                # 100ms
@@ -66,6 +82,16 @@ def detect_allowed_language(model, audio):
     return "en"
 
 
+# SenseVoice 的輸出開頭帶語言標籤，如 ``<|zh|><|NEUTRAL|><|Speech|><|woitn|>文字``。
+_SV_TAG_RE = re.compile(r"<\|([a-z]+)\|>")
+
+
+def sensevoice_language(raw_text):
+    """從 SenseVoice 原始輸出取出語言碼（zh/yue/ja/ko/en），取不到回 'zh'。"""
+    m = _SV_TAG_RE.search(raw_text or "")
+    return m.group(1) if m else "zh"
+
+
 def get_usb_microphone_index(p):
     """自動尋找 USB 麥克風的索引號；找不到則回傳 None（用預設輸入裝置）。"""
     for i in range(p.get_device_count()):
@@ -82,10 +108,12 @@ class SpeechToText:
     寫進畫面、還是丟給 LLM（此專案：丟給多模態 LLM 找出要追蹤的人）。
     """
 
-    def __init__(self, status_cb=None, show_rms=False, to_traditional=True):
+    def __init__(self, status_cb=None, show_rms=False, to_traditional=True,
+                 engine=None):
         self.status_cb = status_cb or (lambda _m: None)
         self.show_rms = show_rms
         self.to_traditional = to_traditional
+        self.engine = (engine or STT_ENGINE).lower()
         self.model = None
         self._s2tw = None
         self._stop = threading.Event()
@@ -94,6 +122,20 @@ class SpeechToText:
         self.status_cb(msg)
 
     def load_model(self):
+        if self.engine == "sensevoice":
+            self._load_sensevoice()
+        else:
+            self._load_whisper()
+        if self.to_traditional:
+            try:
+                from opencc import OpenCC
+                self._s2tw = OpenCC("s2twp")   # 簡體 → 繁體（台灣慣用詞）
+            except Exception as e:                              # noqa: BLE001
+                self._status(f"OpenCC 不可用（{e}）；輸出維持簡體。")
+                self._s2tw = None
+        self._status("模型載入完成。")
+
+    def _load_whisper(self):
         from faster_whisper import WhisperModel
         self._status(f"載入 Faster-Whisper 模型 ({MODEL_SIZE}, {DEVICE})…")
         try:
@@ -104,14 +146,19 @@ class SpeechToText:
             # 短指令在 CPU 上仍可接受（large-v3-turbo 約數秒）。
             self._status(f"CUDA STT 不可用（{e}）；改用 CPU int8。")
             self.model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
-        if self.to_traditional:
-            try:
-                from opencc import OpenCC
-                self._s2tw = OpenCC("s2twp")   # 簡體 → 繁體（台灣慣用詞）
-            except Exception as e:                              # noqa: BLE001
-                self._status(f"OpenCC 不可用（{e}）；輸出維持簡體。")
-                self._s2tw = None
-        self._status("模型載入完成。")
+
+    def _load_sensevoice(self):
+        """SenseVoiceSmall（FunASR）：CJK ASR，跑在 torch+CUDA。"""
+        from funasr import AutoModel
+        self._status(f"載入 SenseVoice 模型 ({SENSEVOICE_MODEL}, {DEVICE})…")
+        dev = DEVICE if DEVICE.startswith("cuda") else "cpu"
+        try:
+            self.model = AutoModel(model=SENSEVOICE_MODEL, device=dev,
+                                   disable_update=True, disable_pbar=True)
+        except Exception as e:                                  # noqa: BLE001
+            self._status(f"CUDA STT 不可用（{e}）；改用 CPU。")
+            self.model = AutoModel(model=SENSEVOICE_MODEL, device="cpu",
+                                   disable_update=True, disable_pbar=True)
 
     def stop(self):
         self._stop.set()
@@ -198,24 +245,41 @@ class SpeechToText:
             return
 
         self._status(f"[辨識中… VAD 修剪 {duration:.1f}s → {speech_dur:.1f}s]")
+        if self.engine == "sensevoice":
+            text, lang = self._transcribe_sensevoice(trimmed)
+        else:
+            text, lang = self._transcribe_whisper(trimmed)
+
+        # zh / yue（粵語）才做簡轉繁；ja / ko / en 維持原樣。
+        if lang in ("zh", "yue") and self._s2tw is not None:
+            text = self._s2tw.convert(text)
+
+        if text:
+            on_text(text, lang)
+        else:
+            self._status(">>> 未偵測到任何文字（或被信心門檻過濾）")
+
+    def _transcribe_whisper(self, trimmed):
         lang = detect_allowed_language(self.model, trimmed)
         segments, info = self.model.transcribe(
             trimmed, beam_size=5, language=lang,
             condition_on_previous_text=False, vad_filter=False,
         )
-        segs = list(segments)
         good = [
-            s.text for s in segs
+            s.text for s in segments
             if s.no_speech_prob < MAX_NO_SPEECH_PROB and s.avg_logprob > MIN_AVG_LOGPROB
         ]
-        text = "".join(good).strip()
-        if info.language == "zh" and self._s2tw is not None:
-            text = self._s2tw.convert(text)
+        return "".join(good).strip(), info.language
 
-        if text:
-            on_text(text, info.language)
-        else:
-            self._status(">>> 未偵測到任何文字（或被信心門檻過濾）")
+    def _transcribe_sensevoice(self, trimmed):
+        from funasr.utils.postprocess_utils import rich_transcription_postprocess
+        res = self.model.generate(
+            input=trimmed, cache={}, language=SENSEVOICE_LANGUAGE,
+            use_itn=True, ban_emo_unk=True, batch_size_s=60,
+        )
+        raw = res[0]["text"] if res else ""
+        lang = sensevoice_language(raw)
+        return rich_transcription_postprocess(raw).strip(), lang
 
 
 def main():

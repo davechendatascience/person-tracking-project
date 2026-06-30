@@ -42,9 +42,17 @@ def _bringup(context, *args, **kwargs):
     # Each tracker variant publishes on its own pre-remap topic; the
     # `detection_source:=edgetam` arg below points that topic at the
     # BT's contract topic regardless of which tracker is active.
+    tracker_env = dict(os.environ)
     if tracker_kind == "aot":
         tracker_script = "aot_tracker.py"
         tracker_topic  = "/follower/camera/detections_aot"
+    elif tracker_kind == "sam2_aotmem":
+        # Same EdgeTAM node + topic, with the AOT long/short-term memory
+        # promotion enabled (frozen SAM2 fork + AOT memory). Flat per-frame
+        # cost (bounded LT), so faster on average than AOT on long runs.
+        tracker_script = "edgetam_tracker.py"
+        tracker_topic  = "/follower/camera/detections_edgetam"
+        tracker_env["SAM2_AOT_MEM"] = "1"
     else:
         tracker_script = "edgetam_tracker.py"
         tracker_topic  = "/follower/camera/detections_edgetam"
@@ -78,7 +86,7 @@ def _bringup(context, *args, **kwargs):
 
     return [
         ExecuteProcess(
-            cmd=tracker_cmd,
+            cmd=tracker_cmd, env=tracker_env,
             output="both", cwd=repo, emulate_tty=True),
         ExecuteProcess(
             cmd=follower_cmd,
@@ -98,7 +106,8 @@ def generate_launch_description():
             "tracker_kind",
             default_value="edgetam",
             description="edgetam (SAM2 fork, default) | "
-                        "aot (AOT/DeAOT family, occlusion-robust memory)"),
+                        "aot (AOT/DeAOT family, occlusion-robust memory) | "
+                        "sam2_aotmem (EdgeTAM + AOT long/short-term memory)"),
         DeclareLaunchArgument(
             "follower_kind",
             default_value="bt",

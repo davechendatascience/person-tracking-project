@@ -798,6 +798,25 @@ class EdgeTAMTracker(Node):
                 self.img_width = 0
                 self.img_height = 0
                 self.inference_state = None
+                # --- AOT long/short-term memory (sam2-aotmem) ---
+                # Promote confident, size-stable propagated frames into
+                # cond_frame_outputs (SAM2's always-attended long-term tier),
+                # bounded by FIFO eviction (frame 0 protected). Off by default —
+                # the follower launch sets SAM2_AOT_MEM=1 for
+                # tracker_kind:=sam2_aotmem; with it off EdgeTAM is unchanged.
+                import os as _os
+                self._mem = _os.environ.get("SAM2_AOT_MEM", "0") == "1"
+                self._mem_gap = int(_os.environ.get("SAM2_AOT_MEM_GAP", "10"))
+                self._mem_lt_max = int(_os.environ.get("SAM2_AOT_MEM_LT_MAX", "6"))
+                self._mem_lo = float(_os.environ.get("SAM2_AOT_MEM_AREA_LO", "0.6"))
+                self._mem_hi = float(_os.environ.get("SAM2_AOT_MEM_AREA_HI", "1.6"))
+                self._mem_promoted = []
+                self._mem_area_hist = []
+                self._mem_n = 0
+                if self._mem:
+                    print(f"[sam2-aotmem] AOT memory ON "
+                          f"(gap={self._mem_gap}, lt_max={self._mem_lt_max})",
+                          flush=True)
 
             def _prepare_image(self, image_pil):
                 arr = np.array(image_pil)
@@ -904,7 +923,53 @@ class EdgeTAMTracker(Node):
                 if m is None:
                     m = np.zeros(
                         (self.img_height, self.img_width), dtype=np.uint8)
+                # AOT long-term memory promotion (sam2-aotmem). Runs before the
+                # worker's short-term eviction, so a promoted frame is already in
+                # cond and won't be dropped by the non_cond eviction.
+                if self._mem and not init:
+                    px = int(m.sum())
+                    self._mem_area_hist.append(px)
+                    if self._mem_should_promote(self.frame_index, px):
+                        self._mem_promote(self.frame_index)
                 return {"pred_mask": m}
+
+            def _mem_should_promote(self, idx, px):
+                """DMAOT-style gate: periodic, non-empty, size-stable."""
+                if (not self._mem or idx == 0 or self._mem_gap <= 0
+                        or idx % self._mem_gap != 0 or px < 50):
+                    return False
+                if self._mem_area_hist:
+                    med = float(np.median(self._mem_area_hist[-10:]))
+                    if med > 0 and not (
+                            self._mem_lo * med <= px <= self._mem_hi * med):
+                        return False  # size jump -> likely drift/distractor
+                return True
+
+            def _mem_promote(self, idx):
+                """Move propagated frame idx non_cond -> cond (always-attended
+                long-term anchor), then FIFO-evict beyond lt_max. Frame 0 is
+                never in _mem_promoted, so it is never evicted (SAM2's preflight
+                requires the prompt frame to stay in cond)."""
+                od = self.inference_state["output_dict"]
+                if idx not in od["non_cond_frame_outputs"]:
+                    return
+                od["cond_frame_outputs"][idx] = \
+                    od["non_cond_frame_outputs"].pop(idx)
+                for obj in self.inference_state["output_dict_per_obj"].values():
+                    if idx in obj["non_cond_frame_outputs"]:
+                        obj["cond_frame_outputs"][idx] = \
+                            obj["non_cond_frame_outputs"].pop(idx)
+                self._mem_promoted.append(idx)
+                self._mem_n += 1
+                while len(self._mem_promoted) > self._mem_lt_max:
+                    v = self._mem_promoted.pop(0)
+                    od["cond_frame_outputs"].pop(v, None)
+                    for obj in self.inference_state["output_dict_per_obj"].values():
+                        obj["cond_frame_outputs"].pop(v, None)
+                print(f"[sam2-aotmem] promote f{idx} -> LT "
+                      f"({len(self._mem_promoted)}/{self._mem_lt_max}, "
+                      f"px={self._mem_area_hist[-1]}, total={self._mem_n})",
+                      flush=True)
 
         return _EdgeTAMStreamingTracker()
 

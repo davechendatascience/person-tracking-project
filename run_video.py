@@ -130,6 +130,12 @@ def run_video_tracking():
                         help="中文描述要追蹤的人（YOLO 偵測 + VLM 選擇，取代 --target-color）")
     parser.add_argument("--voice", action="store_true",
                         help="用語音說出要追蹤的人（STT），取代 --describe")
+    parser.add_argument("--tracker", type=str, default="sam2-aotmem",
+                        choices=["sam2-aotmem", "aot"],
+                        help="追蹤器：'sam2-aotmem'（凍結 SAM2 + AOT 記憶，預設）或 "
+                             "'aot'（aot-benchmark demo 的 DeAOT 串流追蹤器）")
+    parser.add_argument("--aot-model", type=str, default="r50_deaotl",
+                        help="--tracker aot 的模型（r50_deaotl / deaott / swinb_deaotl）")
     parser.add_argument("--no-reprompt", action="store_true", help="Disable re-propagation passes")
     parser.add_argument("--max-reprompts", type=int, default=2, help="Max number of re-propagation passes")
     parser.add_argument("--show", action="store_true", help="Show real-time visualization window")
@@ -178,10 +184,14 @@ def run_video_tracking():
     # long/short-term memory, single-object. Replaces the legacy DAM4SAM
     # SAM2Tracker (whose sam21pp_* configs aren't present here).
     if args.mode != "single":
-        print("[ERROR] sam2-aotmem tracker supports --mode single only.")
+        print(f"[ERROR] --tracker {args.tracker} supports --mode single only.")
         return
-    from follow_everything.perception.sam2_aot_memory import SAM2AOTMemoryTracker
-    tracker = SAM2AOTMemoryTracker()
+    if args.tracker == "aot":
+        from follow_everything.perception.aot_tracker import AOTTracker
+        tracker = AOTTracker(model=args.aot_model)
+    else:
+        from follow_everything.perception.sam2_aot_memory import SAM2AOTMemoryTracker
+        tracker = SAM2AOTMemoryTracker()
     
     # 3. Single-mode: identify the target person in the first frame by color.
     target_box = None

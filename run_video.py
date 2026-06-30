@@ -126,6 +126,10 @@ def run_video_tracking():
     parser.add_argument("--num-frames", type=int, default=300)
     parser.add_argument("--yolo-model", type=str, default="yolo11m.pt")
     parser.add_argument("--target-color", type=str, default="red", choices=["red", "black", "any", "random"])
+    parser.add_argument("--describe", type=str, default=None,
+                        help="中文描述要追蹤的人（YOLO 偵測 + VLM 選擇，取代 --target-color）")
+    parser.add_argument("--voice", action="store_true",
+                        help="用語音說出要追蹤的人（STT），取代 --describe")
     parser.add_argument("--no-reprompt", action="store_true", help="Disable re-propagation passes")
     parser.add_argument("--max-reprompts", type=int, default=2, help="Max number of re-propagation passes")
     parser.add_argument("--show", action="store_true", help="Show real-time visualization window")
@@ -169,8 +173,15 @@ def run_video_tracking():
     
     # Override with relevant bits for the demo if needed
     cfg["sam2"]["device"] = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    tracker = SAM2Tracker(cfg["perception"], cfg["sam2"])
+
+    # Tracker: sam2-aotmem — frozen SAM2 (EdgeTAM / Hiera-large) + AOT
+    # long/short-term memory, single-object. Replaces the legacy DAM4SAM
+    # SAM2Tracker (whose sam21pp_* configs aren't present here).
+    if args.mode != "single":
+        print("[ERROR] sam2-aotmem tracker supports --mode single only.")
+        return
+    from follow_everything.perception.sam2_aot_memory import SAM2AOTMemoryTracker
+    tracker = SAM2AOTMemoryTracker()
     
     # 3. Single-mode: identify the target person in the first frame by color.
     target_box = None
@@ -180,12 +191,32 @@ def run_video_tracking():
             print("[ERROR] Could not load the first frame.")
             return
 
-        print(f"[INFO] Identifying the person in {args.target_color} shirt...")
-        target_box = identify_person_by_color(first_frame_data.image, args.target_color, args.yolo_model)
-
-        if target_box is None:
-            print("[ERROR] Could not find a person matching the target color.")
-            return
+        if args.describe or args.voice:
+            # YOLO detects people; a multimodal LLM picks the one matching the
+            # (typed or spoken) Chinese description. Spatial words (左/右/最近)
+            # are resolved from box geometry; appearance goes to the VLM.
+            from stt.target_resolver import detect_and_select
+            description = args.describe or ""
+            if args.voice and not description:
+                from stt.speech_to_text import SpeechToText
+                _res = {}
+                _stt = SpeechToText(status_cb=lambda m: print(m, flush=True))
+                print(">>> 請說出要追蹤的人（一句話）…")
+                _stt.run(lambda t, lang: (_res.update(t=t), _stt.stop()))
+                description = _res.get("t", "")
+            print(f"[INFO] 目標描述：{description!r}（YOLO + VLM 選擇）")
+            target_box, all_boxes = detect_and_select(
+                first_frame_data.image, description, args.yolo_model)
+            print(f"[INFO] YOLO 偵測到 {len(all_boxes)} 人；VLM 選定 box={target_box}")
+            if target_box is None:
+                print("[ERROR] 沒有符合描述的人。")
+                return
+        else:
+            print(f"[INFO] Identifying the person in {args.target_color} shirt...")
+            target_box = identify_person_by_color(first_frame_data.image, args.target_color, args.yolo_model)
+            if target_box is None:
+                print("[ERROR] Could not find a person matching the target color.")
+                return
 
         print(f"[INFO] Found target at {target_box}. Starting tracking...")
 
@@ -309,14 +340,25 @@ def run_video_tracking():
     _write_thread = threading.Thread(target=_write_worker, daemon=False)
     _write_thread.start()
 
-    try:
-        # Initialize the Streaming Loader (will block on index access if file not ready)
-        loader = StreamingFrameLoader(
-            img_paths=img_paths,
-            image_size=tracker._scfg.get("image_size", 1024),
-            device=tracker._scfg["device"]
-        )
+    def _blocking_rgb_frames():
+        """Yield RGB frames as the extraction thread writes them — the frame
+        source for sam2-aotmem's track_sequence."""
+        for p in img_paths:
+            while not p.exists():
+                if stop_extraction.is_set():
+                    return
+                time.sleep(0.002)
+            img = None
+            for _ in range(100):
+                img = cv2.imread(str(p))
+                if img is not None:
+                    break
+                time.sleep(0.002)
+            if img is None:
+                return
+            yield cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
+    try:
         # Per-person BGR colors (used in multi mode)
         _PALETTE = [
             (0,   0,   255),  # red
@@ -331,19 +373,10 @@ def run_video_tracking():
 
         print("[INFO] Starting synchronized tracking & visualization...")
 
-        if args.mode == "single":
-            tracker_gen = tracker.track_sequence(
-                loader,
-                np.array(target_box),
-                allow_reprompt=not args.no_reprompt,
-                max_reprompts=args.max_reprompts,
-            )
-        else:
-            tracker_gen = tracker.track_sequence_multi(
-                loader,
-                yolo_model_path=args.yolo_model,
-                yolo_conf_threshold=args.yolo_conf,
-            )
+        tracker_gen = tracker.track_sequence(
+            _blocking_rgb_frames(),
+            initial_bbox=np.array(target_box),
+        )
 
         for i, frame_output in enumerate(tqdm(tracker_gen, total=total_expected, desc="Tracking")):
             # Unpack single vs multi yield shape

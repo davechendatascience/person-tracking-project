@@ -1,0 +1,17 @@
+# --- multimodal target resolver ---
+# Default backend "hf": local Qwen2-VL-2B-Instruct (no API key / server).
+transformers>=4.49
+qwen-vl-utils
+accelerate
+# (torch is already in the project .venv)
+
+# Optional backend "openai": any OpenAI-compatible vision endpoint
+# (gpt-4o, local Ollama vision model, vLLM). STT_BACKEND=openai.
+openai>=1.0
+
+# --- speech-to-text (only needed for --voice) ---
+# faster-whisper bundles Silero VAD.
+faster-whisper>=1.0
+opencc-python-reimplemented>=0.1.7   # simplified -> traditional Chinese
+# pyaudio needs the system PortAudio lib first:  sudo apt-get install portaudio19-dev
+pyaudio>=0.2.13

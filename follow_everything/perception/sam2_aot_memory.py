@@ -150,6 +150,7 @@ class SAM2AOTMemoryTracker:
                  min_area_ratio: float = 0.0005,
                  empty_cache_every: int = 200,
                  amp: str = "bf16",           # "bf16" | "fp16" | "none" — ~2.5x on this HW
+                 compile_encoder: bool = True,  # torch.compile the image encoder (~1.4x)
                  verbose: bool = True):
         import torch
         if backbone not in self._BACKBONES:
@@ -157,6 +158,7 @@ class SAM2AOTMemoryTracker:
                              f"choose from {list(self._BACKBONES)}")
         self.amp_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16,
                           "none": None}[amp]
+        self.compile_encoder = compile_encoder
         self.backbone = backbone
         _cfg, _ckpt = self._BACKBONES[backbone]
         self.model_cfg = model_cfg or _cfg
@@ -198,6 +200,26 @@ class SAM2AOTMemoryTracker:
         t = time.time()
         self._predictor = build_sam2_video_predictor(
             self.model_cfg, self.checkpoint, device=self.device)
+        # Free TF32 on Blackwell, and torch.compile the image encoder — it's a
+        # fixed-shape (1024²) feed-forward graph, so it compiles cleanly (unlike
+        # the stateful memory loop) for ~1.4x on the per-frame bottleneck. The
+        # first frame pays a one-time compile cost (~tens of seconds).
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        if self.compile_encoder and self.device.type == "cuda":
+            # Default inductor mode (op fusion), NOT max-autotune: this is a
+            # unified-memory (Grace-Blackwell) box where max-autotune's parallel
+            # GEMM-search workers spike RAM enough to OOM-kill a full-res run —
+            # and it falls back anyway ("Not enough SMs to use max_autotune_gemm")
+            # so the autotune cost buys nothing here. Cap compile threads to keep
+            # the transient compile footprint small. Default mode also avoids
+            # CUDA graphs, so SAM2's stored encoder outputs are never overwritten.
+            os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+            self._predictor.image_encoder = torch.compile(
+                self._predictor.image_encoder, dynamic=False)
+            self._log("torch.compile(image_encoder, default mode) enabled "
+                      "(first frame pays a one-time compile cost)")
         self._log(f"built in {time.time()-t:.1f}s; AOT memory: "
                   f"mem_gap={self.mem_gap} lt_max={self.lt_max} "
                   f"keep_behind={self.keep_behind}")

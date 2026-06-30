@@ -782,6 +782,43 @@ class EdgeTAMTracker(Node):
         log.info(
             f"EdgeTAM predictor built in {time.time() - _t_build:.1f}s "
             "(ready for first frame)")
+
+        # Non-eager + bf16. Mirrors follow_everything/perception/
+        # sam2_aot_memory.py (the run_video path): TF32 + torch.compile the
+        # image encoder (~1.4x) and run the per-frame pipeline under bf16
+        # autocast (~2.5x on this HW). The encoder is a fixed-shape feed-
+        # forward graph, so it compiles cleanly; the stateful memory loop
+        # (propagate_in_video) stays eager — it's bookkeeping, not compute.
+        # Escape hatch: SAM2_AOT_EAGER=1 keeps the old eager fp32 path for
+        # platforms where torch.compile is unavailable.
+        amp = os.environ.get("SAM2_AOT_AMP", "bf16")
+        amp_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16,
+                     "none": None}.get(amp, torch.bfloat16)
+        eager = os.environ.get("SAM2_AOT_EAGER", "0") == "1"
+        if device.type == "cuda" and not eager:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            try:
+                # Default inductor mode (op fusion), NOT max-autotune: on this
+                # unified-memory (Grace-Blackwell) box max-autotune's parallel
+                # GEMM-search workers spike RAM enough to OOM-kill a full-res
+                # run, and it falls back anyway ("Not enough SMs to use
+                # max_autotune_gemm"), so the autotune cost buys nothing here.
+                # Cap compile threads to keep the transient footprint small.
+                # Default mode also avoids CUDA graphs, so SAM2's stored encoder
+                # outputs are never overwritten.
+                os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+                predictor.image_encoder = torch.compile(
+                    predictor.image_encoder, dynamic=False)
+                log.info("torch.compile(image_encoder, default mode) enabled; "
+                         f"autocast={amp} (first frame compiles, slow once)")
+            except Exception as e:  # pragma: no cover - platform fallback
+                log.warning(f"torch.compile unavailable, staying eager: {e}")
+        else:
+            amp_dtype = None if eager else amp_dtype
+            log.info(f"EdgeTAM running eager (SAM2_AOT_EAGER={eager}), "
+                     f"autocast={'none' if amp_dtype is None else amp}")
         img_mean = torch.tensor(
             [0.485, 0.456, 0.406], dtype=torch.float32, device=device)[:, None, None]
         img_std = torch.tensor(
@@ -798,6 +835,10 @@ class EdgeTAMTracker(Node):
                 self.img_width = 0
                 self.img_height = 0
                 self.inference_state = None
+                # bf16 autocast context for the per-frame forward pass
+                # (encoder + memory attention + decoder). None -> eager fp32.
+                self._amp_dtype = amp_dtype
+                self._device = device
                 # --- AOT long/short-term memory (sam2-aotmem) ---
                 # Promote confident, size-stable propagated frames into
                 # cond_frame_outputs (SAM2's always-attended long-term tier),
@@ -817,6 +858,13 @@ class EdgeTAMTracker(Node):
                     print(f"[sam2-aotmem] AOT memory ON "
                           f"(gap={self._mem_gap}, lt_max={self._mem_lt_max})",
                           flush=True)
+
+            def _autocast(self):
+                """bf16 autocast over the forward pass; nullcontext in eager/CPU."""
+                import contextlib
+                if self._amp_dtype is not None and self._device.type == "cuda":
+                    return torch.autocast(self._device.type, dtype=self._amp_dtype)
+                return contextlib.nullcontext()
 
             def _prepare_image(self, image_pil):
                 arr = np.array(image_pil)
@@ -874,27 +922,28 @@ class EdgeTAMTracker(Node):
                 self.inference_state["images"][0] = self._prepare_image(image)
                 self.inference_state["num_frames"] = 1
                 self.predictor.reset_state(self.inference_state)
-                self.predictor._get_image_feature(
-                    self.inference_state, frame_idx=0, batch_size=1)
-                # EdgeTAM's appearance head locks more reliably on a
-                # dense bbox prompt than a sparse depth-filtered mask
-                # (a 32 × 93 person box at 5 m only had ~655 mask px,
-                # ~22% of the bbox area, which collapsed to 0 px after
-                # one propagation step). Prefer bbox when available and
-                # fall back to mask only if no bbox was supplied.
-                if bbox is not None:
-                    x, y, w, h = bbox  # xywh
-                    box = np.array([x, y, x + w, y + h], dtype=np.float32)
-                    _, _, out_logits = self.predictor.add_new_points_or_box(
-                        inference_state=self.inference_state,
-                        frame_idx=0, obj_id=0, box=box)
-                elif init_mask is not None:
-                    _, _, out_logits = self.predictor.add_new_mask(
-                        inference_state=self.inference_state,
-                        frame_idx=0, obj_id=0, mask=init_mask)
-                else:
-                    raise ValueError(
-                        "EdgeTAM init: neither bbox nor init_mask provided")
+                with self._autocast():
+                    self.predictor._get_image_feature(
+                        self.inference_state, frame_idx=0, batch_size=1)
+                    # EdgeTAM's appearance head locks more reliably on a
+                    # dense bbox prompt than a sparse depth-filtered mask
+                    # (a 32 × 93 person box at 5 m only had ~655 mask px,
+                    # ~22% of the bbox area, which collapsed to 0 px after
+                    # one propagation step). Prefer bbox when available and
+                    # fall back to mask only if no bbox was supplied.
+                    if bbox is not None:
+                        x, y, w, h = bbox  # xywh
+                        box = np.array([x, y, x + w, y + h], dtype=np.float32)
+                        _, _, out_logits = self.predictor.add_new_points_or_box(
+                            inference_state=self.inference_state,
+                            frame_idx=0, obj_id=0, box=box)
+                    elif init_mask is not None:
+                        _, _, out_logits = self.predictor.add_new_mask(
+                            inference_state=self.inference_state,
+                            frame_idx=0, obj_id=0, mask=init_mask)
+                    else:
+                        raise ValueError(
+                            "EdgeTAM init: neither bbox nor init_mask provided")
                 m = (out_logits[0, 0] > 0).float().cpu().numpy().astype(np.uint8)
                 # Drop the prepared image now that features are cached.
                 self.inference_state["images"].pop(0, None)
@@ -911,12 +960,13 @@ class EdgeTAMTracker(Node):
                 self.inference_state["images"][self.frame_index] = (
                     self._prepare_image(image))
                 m = None
-                for out in self.predictor.propagate_in_video(
-                        self.inference_state,
-                        start_frame_idx=self.frame_index,
-                        max_frame_num_to_track=0):
-                    out_logits = out[2]
-                    m = (out_logits[0, 0] > 0).float().cpu().numpy().astype(np.uint8)
+                with self._autocast():
+                    for out in self.predictor.propagate_in_video(
+                            self.inference_state,
+                            start_frame_idx=self.frame_index,
+                            max_frame_num_to_track=0):
+                        out_logits = out[2]
+                        m = (out_logits[0, 0] > 0).float().cpu().numpy().astype(np.uint8)
                 # Free the prepared image; cached features remain for
                 # the conditioning lookup, identical to DAM4SAM's flow.
                 self.inference_state["images"].pop(self.frame_index, None)

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  FastDDS profile: large shared-memory segment for big image samples.
+
+  Why: the sim publishes 320x240 rgb8 images (~230 KB) on
+  /follower/camera/edgetam_overlay and /follower/camera/image at ~15 Hz. The
+  DEFAULT FastDDS shared-memory segment is only ~512 KB, so a 230 KB sample
+  (x KEEP_LAST history) overruns the pool and the reader fails with
+  "sequence size exceeds remaining buffer" — which is exactly why RViz's
+  Image display stays blank. A 64 MB segment holds the backlog comfortably.
+
+  Verified: depth-1 reliable reader went from 0 good / 16 err (default) to
+  77 good / 2 err (this profile), at the full ~15 Hz publish rate.
+
+  This MUST be active for BOTH the publisher (tracker) and the subscriber
+  (RViz). docker-compose.yml sets FASTRTPS_DEFAULT_PROFILES_FILE to this file
+  for the whole container, so every node inherits it.
+-->
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <profiles>
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>shm_large</transport_id>
+        <type>SHM</type>
+        <segment_size>67108864</segment_size>   <!-- 64 MB -->
+      </transport_descriptor>
+      <!-- Keep UDP as a fallback transport (off-host / discovery). -->
+      <transport_descriptor>
+        <transport_id>udp</transport_id>
+        <type>UDPv4</type>
+      </transport_descriptor>
+    </transport_descriptors>
+
+    <participant profile_name="large_image_participant" is_default_profile="true">
+      <rtps>
+        <userTransports>
+          <transport_id>shm_large</transport_id>
+          <transport_id>udp</transport_id>
+        </userTransports>
+        <!-- false => use only the transports listed above (our big SHM + UDP),
+             not the default 512 KB SHM segment. -->
+        <useBuiltinTransports>false</useBuiltinTransports>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>

@@ -111,6 +111,8 @@ X11 forwarding 適合 RViz / image stream，跑 Gazebo 3D 視窗會偏慢；要�
 | `Authorization required, but no authorization protocol specified`     | 在同一 display 的 shell 重跑 `xhost +local:root`                       |
 | `cannot open display:`                                                | `DISPLAY` 沒匯出或 `/tmp/.X11-unix` 沒掛上                              |
 | Gazebo 開起來是黑窗 / "failed to create drawable"                      | 容器內沒有 OpenGL context，X11 forwarding 試 `LIBGL_ALWAYS_INDIRECT=1` |
+| RViz overlay 一片空白、log 刷 `sequence size exceeds remaining buffer` | FastDDS 預設 SHM segment（~512 KB）裝不下 230 KB 影像；compose 已設 `FASTRTPS_DEFAULT_PROFILES_FILE=/ws/fastdds_large_image.xml`，既有容器需 `docker compose up -d --force-recreate sim` 重建 |
+| Image 顯示有了但仍空白                                                 | 確認 Image display 的 QoS Reliability = Reliable（與 publisher 一致），或直接載入 `follower_pkg/rviz/follower.rviz` |
 | RViz / overlay 沒問題，Gazebo 不行                                     | Gazebo 需要 direct GL，X11 forwarded GL 不夠力，改用 VNC                |
 
 ---
@@ -139,6 +141,29 @@ docker exec -it follow_everything_nav2_3d bash -lc \
 | `ros2 launch sim/launch/empty_bringup.launch.py detection_source:=oracle`     | oracle 直接發布（EdgeTAM 改名為 `_edgetam`）       |
 
 切換地圖：將 `empty` 改為 `cluttered`、`forest`、`corridor`；`build_world.py` 會從 2D 專案的 ASCII 地圖（`../follow_everything_nav2/sim/maps/*.txt`）自動生成對應的 3D 世界。
+
+### 5.1 在 RViz 查看 EdgeTAM / SAM2-AOTmem overlay
+
+追蹤器會把「SAM2 實際處理的 RGB 影格 + 紅色 mask + 綠色質心點 + 狀態文字」發布到
+`/follower/camera/edgetam_overlay`。本 repo 附了一份 RViz 設定檔
+（`follower_pkg/rviz/follower.rviz`，已預先設好 Image display、QoS=Reliable，
+開啟即顯示，不必手動加 display）：
+
+```bash
+# 方法 A：跟 follower 一起開（最方便）
+docker exec -it follow_everything_nav2_3d bash -lc \
+  'source /opt/ros/humble/setup.bash && \
+   ros2 launch follower_pkg/launch/follower.launch.py rviz:=true'
+
+# 方法 B：另開一個終端單獨啟動 RViz
+docker exec -it follow_everything_nav2_3d bash -lc \
+  'source /opt/ros/humble/setup.bash && rviz2 -d follower_pkg/rviz/follower.rviz'
+```
+
+若 overlay 一片空白，見上方「常見問題」的 `sequence size exceeds remaining buffer`
+一列——多半是 FastDDS SHM segment 太小，compose 已設好
+`fastdds_large_image.xml` 修正，既有容器以 `docker compose up -d --force-recreate sim`
+重建即可。
 
 ---
 

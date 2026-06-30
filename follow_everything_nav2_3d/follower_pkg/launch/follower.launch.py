@@ -38,6 +38,7 @@ def _bringup(context, *args, **kwargs):
     detection_source = LaunchConfiguration("detection_source").perform(context)
     follower_kind    = LaunchConfiguration("follower_kind").perform(context)
     tracker_kind     = LaunchConfiguration("tracker_kind").perform(context)
+    rviz             = LaunchConfiguration("rviz").perform(context)
 
     # Each tracker variant publishes on its own pre-remap topic; the
     # `detection_source:=edgetam` arg below points that topic at the
@@ -84,7 +85,7 @@ def _bringup(context, *args, **kwargs):
     follower_env["PYTHONPATH"] = (
         "/opt/follow_everything_nav2:" + fenv_pp).rstrip(":")
 
-    return [
+    procs = [
         ExecuteProcess(
             cmd=tracker_cmd, env=tracker_env,
             output="both", cwd=repo, emulate_tty=True),
@@ -93,6 +94,19 @@ def _bringup(context, *args, **kwargs):
             env=follower_env,
             output="both", cwd=repo, emulate_tty=True),
     ]
+
+    # Optional RViz with the EdgeTAM/SAM2-AOTmem overlay preconfigured.
+    # The shipped config has an Image display on the overlay topic with
+    # Reliable QoS (matching the publisher) — the overlay shows on open,
+    # no manual display setup needed. Needs an X server in the container
+    # (see README's RViz/X11 section).
+    if rviz.lower() in ("1", "true", "yes"):
+        rviz_cfg = os.path.join(repo, "follower_pkg", "rviz", "follower.rviz")
+        procs.append(ExecuteProcess(
+            cmd=["rviz2", "-d", rviz_cfg],
+            output="both", cwd=repo, emulate_tty=True))
+
+    return procs
 
 
 def generate_launch_description():
@@ -113,5 +127,10 @@ def generate_launch_description():
             default_value="bt",
             description="bt (follow_everything_follower with BT) | "
                         "simple (proportional simple_follower for regression)"),
+        DeclareLaunchArgument(
+            "rviz",
+            default_value="false",
+            description="true -> open RViz with follower_pkg/rviz/follower.rviz "
+                        "(EdgeTAM overlay preconfigured). Needs X in container."),
         OpaqueFunction(function=_bringup),
     ])

@@ -1,0 +1,120 @@
+Panels:
+  - Class: rviz_common/Displays
+    Help Height: 70
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /EdgeTAM Overlay1
+        - /EdgeTAM Overlay1/Topic1
+      Splitter Ratio: 0.5
+    Tree Height: 600
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Alpha: 0.5
+      Cell Size: 1
+      Color: 160; 160; 164
+      Line Style:
+        Line Width: 0.03
+        Value: Lines
+      Plane: XY
+      Plane Cell Count: 20
+      Reference Frame: <Fixed Frame>
+      Value: true
+    # --- The EdgeTAM / SAM2-AOTmem debug overlay ---
+    # Plain Image display (NOT Camera): it renders the 2D image regardless of
+    # TF, so it shows even if follower/camera_optical_frame is missing from /tf.
+    # Reliability MUST be Reliable to match the publisher (create_publisher
+    # default QoS in edgetam_tracker.py / aot_tracker.py).
+    - Class: rviz_default_plugins/Image
+      Name: EdgeTAM Overlay
+      Enabled: true
+      Max Value: 1
+      Min Value: 0
+      Median window: 5
+      Normalize Range: true
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /follower/camera/edgetam_overlay
+      Value: true
+    # Raw simulator camera, for side-by-side reference. Gazebo publishes this
+    # as sensor-data (Best Effort), so this display is set Best Effort.
+    - Class: rviz_default_plugins/Image
+      Name: Sim Camera (raw)
+      Enabled: false
+      Max Value: 1
+      Min Value: 0
+      Median window: 5
+      Normalize Range: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /follower/camera/image
+      Value: false
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Marker Scale: 1
+      Show Arrows: true
+      Show Axes: true
+      Show Names: true
+      Value: true
+    - Class: rviz_default_plugins/LaserScan
+      Name: LaserScan
+      Enabled: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /follower/scan
+      Size (m): 0.05
+      Style: Flat Squares
+      Color: 255; 255; 255
+      Value: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: follower/odom
+    Frame Rate: 30
+  Global Status:
+    Current:
+      Value: true
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Distance: 12
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Pitch: 0.6
+      Yaw: 0.785
+      Target Frame: <Fixed Frame>
+    Saved: ~
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 800
+  Width: 1200
+  Hide Left Dock: false
+  Hide Right Dock: false
+  EdgeTAM Overlay:
+    collapsed: false

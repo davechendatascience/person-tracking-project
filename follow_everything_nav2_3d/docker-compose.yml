@@ -17,6 +17,11 @@ services:
       - XAUTHORITY=/tmp/.docker.xauth
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=all
+      # Large FastDDS shared-memory segment so 230 KB rgb8 images
+      # (camera + EdgeTAM overlay) don't overrun the default ~512 KB SHM
+      # pool — without this, readers (RViz) fail to deserialize and the
+      # Image display stays blank. See fastdds_large_image.xml.
+      - FASTRTPS_DEFAULT_PROFILES_FILE=/ws/fastdds_large_image.xml
     deploy:
       resources:
         reservations:

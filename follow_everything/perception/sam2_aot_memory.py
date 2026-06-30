@@ -136,7 +136,7 @@ class SAM2AOTMemoryTracker:
     }
 
     def __init__(self,
-                 backbone: str = "sam2-large",
+                 backbone: str = "sam2-small",
                  model_cfg: Optional[str] = None,
                  checkpoint: Optional[str] = None,
                  device: str = "cuda",

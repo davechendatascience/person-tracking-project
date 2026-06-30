@@ -50,7 +50,7 @@ Visualization Manager:
     # as sensor-data (Best Effort), so this display is set Best Effort.
     - Class: rviz_default_plugins/Image
       Name: Sim Camera (raw)
-      Enabled: false
+      Enabled: true
       Max Value: 1
       Min Value: 0
       Median window: 5
@@ -62,7 +62,7 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Best Effort
         Value: /follower/camera/image
-      Value: false
+      Value: true
     - Class: rviz_default_plugins/TF
       Name: TF
       Enabled: true

@@ -154,9 +154,30 @@ class SAM2AOTMemoryTracker:
                  # --- appearance-gated promotion (anti-contamination) ---
                  promote_appearance_gate: bool = True,  # gate LT writes on obj_ptr identity
                  appearance_tau: float = 0.65,  # min cos(candidate, trusted ref) to promote
-                 trusted_ref_k: int = 4,        # # early anchors that freeze the trusted ref
+                 trusted_ref_k: int = 5,        # # early anchors that freeze the trusted ref
                  drift_floor: float = 0.5,      # cos below this counts toward a drift run
                  drift_patience: int = 12,      # consecutive low-cos frames -> freeze promotion
+                 # --- short-term-vs-long-term coherence audit (anti-flip) ---
+                 # The clean long-term anchors are the trusted identity; a frame that
+                 # flips onto a distractor is an outlier vs that set. Evict such
+                 # frames from SHORT-TERM memory (where the flip actually cascades)
+                 # so later frames can't attend to them. Persistence avoids dropping
+                 # brief hard poses of the tracked target. NOTE: obj_ptr conflates
+                 # pose+identity so this is noisy; a pose-invariant descriptor
+                 # (ReID/color) is the planned upgrade to the *signal* — the
+                 # *structure* here is unchanged by that swap.
+                 distractor_reject: bool = True,  # evict short-term frames incoherent with LT
+                 st_audit_tau: float = 0.5,     # min median cos(frame, LT anchors) to keep
+                 identity_vote_min: int = 2,    # (telemetry only) top-K trusted-anchor vote
+                 reject_patience: int = 8,      # consecutive fails before evicting (skip brief dips)
+                 # --- memory self-consistency audit (robust anti-contamination) ---
+                 # Periodically evict long-term anchors that are outliers vs the
+                 # coherent majority — the contaminated frames that slipped past the
+                 # promotion gate. Judges the accumulated (stable) memory set, not a
+                 # single noisy live frame, so it never touches good tracking.
+                 audit_memory: bool = True,
+                 audit_gap: int = 30,           # run the audit every N frames
+                 audit_tau: float = 0.5,        # evict anchor if median cos to others < this
                  collect_telemetry: bool = False,  # record per-frame obj_ptr identity stats
                  verbose: bool = True):
         import torch
@@ -201,6 +222,15 @@ class SAM2AOTMemoryTracker:
         self.trusted_ref_k = trusted_ref_k
         self.drift_floor = drift_floor
         self.drift_patience = drift_patience
+        self.distractor_reject = distractor_reject
+        self.st_audit_tau = st_audit_tau
+        self.identity_vote_min = identity_vote_min
+        self.reject_patience = reject_patience
+        self._reject_run = 0            # consecutive frames failing the identity vote
+        self._pending_fail: List[int] = []  # failing frames not yet suppressed
+        self.audit_memory = audit_memory
+        self.audit_gap = audit_gap
+        self.audit_tau = audit_tau
         self._trusted_ref = None        # frozen identity reference (normalized)
         self._ref_ptrs: List = []       # accumulates first trusted_ref_k anchors
         self._drift_low = 0             # consecutive frames with cos < drift_floor
@@ -332,6 +362,41 @@ class SAM2AOTMemoryTracker:
                 obj["cond_frame_outputs"].pop(victim, None)
             self._n_evicted += 1
 
+    def _audit_memory(self, state) -> None:
+        """Self-consistency sweep of the long-term anchors: evict any promoted
+        anchor whose obj_ptr is an outlier vs the coherent majority — a
+        contaminated frame that slipped past the promotion gate and 'accidentally
+        got in'. Operates on the accumulated (stable) memory set, not a noisy live
+        frame, so it never disturbs good tracking. Frame 0 (seed) is protected.
+
+        A clean anchor's median cosine to the other anchors is high (~0.7-0.9);
+        a wrong-identity anchor scores low against all of them (~0.3-0.5)."""
+        if len(self._promoted) < 3:
+            return  # need a majority to judge outliers against
+        import torch
+        ptrs = {i: self._obj_ptr(state, i) for i in self._promoted}
+        ids = [i for i in self._promoted if ptrs[i] is not None]
+        if len(ids) < 3:
+            return
+        for i in list(ids):
+            others = sorted(float((ptrs[i] * ptrs[j]).sum())
+                            for j in ids if j != i)
+            coh = others[len(others) // 2]          # median cos to the rest
+            if coh < self.audit_tau:
+                self._evict_anchor(state, i)
+                self._log(f"audit: evict outlier anchor f{i} "
+                          f"(coherence={coh:.3f} < {self.audit_tau})")
+
+    def _evict_anchor(self, state, frame_idx: int) -> None:
+        """Remove a single promoted long-term anchor (used by the audit)."""
+        od = state["output_dict"]
+        od["cond_frame_outputs"].pop(frame_idx, None)
+        for obj in state["output_dict_per_obj"].values():
+            obj["cond_frame_outputs"].pop(frame_idx, None)
+        if frame_idx in self._promoted:
+            self._promoted.remove(frame_idx)
+        self._n_evicted += 1
+
     def _evict_short_term(self, state, frame_idx: int) -> None:
         """Drop non-cond frames + cached features older than the recent window
         so VRAM stays bounded (SAM2 never auto-evicts non_cond). Promoted
@@ -403,6 +468,54 @@ class SAM2AOTMemoryTracker:
             return None
         return float((ptr * self._trusted_ref).sum())
 
+    def _identity_vote(self, state, frame_idx):
+        """Compare this frame's obj_ptr against EACH of the frozen top-K trusted
+        anchors (not their mean). Returns (vote, median_cos): vote = how many of
+        the K score >= appearance_tau. Calibrated on two_girls_dance: the tracked
+        girl scores 4-5/5; a flip onto the distractor scores 0-2/5. Returns
+        (None, nan) until the trusted set exists or if the frame has no obj_ptr."""
+        if not self._ref_ptrs:
+            return None, float("nan")
+        ptr = self._obj_ptr(state, frame_idx)
+        if ptr is None:
+            return None, float("nan")
+        cos = sorted(float((ptr * a).sum()) for a in self._ref_ptrs)
+        vote = sum(1 for c in cos if c >= self.appearance_tau)
+        return vote, cos[len(cos) // 2]
+
+    def _lt_coherence(self, state, frame_idx):
+        """Median cosine of this frame's obj_ptr to the CLEAN long-term anchors —
+        the trusted-identity reference. High for the tracked target (it matches
+        its own LT anchors across poses), low for a flip onto a distractor (it
+        matches none of them). Returns None until enough anchors exist / no ptr.
+
+        Using the accumulated LT set (which spans several poses, kept clean by the
+        promotion gate) tolerates pose variation better than one frozen anchor."""
+        if len(self._promoted) < 2:
+            return None
+        ptr = self._obj_ptr(state, frame_idx)
+        if ptr is None:
+            return None
+        cos = []
+        for k in self._promoted:
+            a = self._obj_ptr(state, k)
+            if a is not None:
+                cos.append(float((ptr * a).sum()))
+        if not cos:
+            return None
+        cos.sort()
+        return cos[len(cos) // 2]
+
+    def _suppress_frame(self, state, frame_idx):
+        """Distractor rejection: drop this frame's short-term memory write so a
+        flipped/wrong-identity mask can't be attended by later frames. This is
+        what makes contamination REVERSIBLE — the clean anchors keep driving the
+        track and it re-acquires the target when it reappears. Mirrors the
+        short-term eviction pop, so it touches no consolidated (cond) set."""
+        state["output_dict"]["non_cond_frame_outputs"].pop(frame_idx, None)
+        for obj in state["output_dict_per_obj"].values():
+            obj["non_cond_frame_outputs"].pop(frame_idx, None)
+
     def _update_trusted_ref(self, state, frame_idx):
         """Build the trusted identity reference from the first trusted_ref_k
         promoted (early, clean) anchors, then freeze it."""
@@ -419,7 +532,8 @@ class SAM2AOTMemoryTracker:
             self._log(f"trusted identity reference frozen from "
                       f"{len(self._ref_ptrs)} anchors")
 
-    def _record_telemetry(self, state, frame_idx, res, px, size_gate, promoted):
+    def _record_telemetry(self, state, frame_idx, res, px, size_gate, promoted,
+                          distractor=False):
         """Log per-frame identity stats for promotion-threshold calibration."""
         import torch
         ptr = self._obj_ptr(state, frame_idx)
@@ -434,12 +548,23 @@ class SAM2AOTMemoryTracker:
             if anchors:
                 cos_lt = float(torch.stack([(ptr * a).sum()
                                             for a in anchors]).mean())
+        # cosine to each of the frozen top-K trusted anchors (individually) —
+        # the "compare against ≥5 frames to be sure" signal for a robust vote.
+        cos5_med = cos5_min = float("nan")
+        cos5_vote = 0
+        if ptr is not None and self._ref_ptrs:
+            c5 = sorted(float((ptr * a).sum()) for a in self._ref_ptrs)
+            cos5_med = c5[len(c5) // 2]
+            cos5_min = c5[0]
+            cos5_vote = sum(1 for c in c5 if c >= self.appearance_tau)
         cx, cy = (res.centroid_uv if res.centroid_uv is not None
                   else (float("nan"), float("nan")))
         self._telemetry.append(dict(
             frame=frame_idx, cos_seed=cos_seed, cos_lt=cos_lt,
+            cos5_med=cos5_med, cos5_min=cos5_min, cos5_vote=cos5_vote,
             cx=cx, cy=cy, area=px, visible=bool(res.is_visible),
-            size_gate=bool(size_gate), promoted=bool(promoted)))
+            size_gate=bool(size_gate), promoted=bool(promoted),
+            distractor=bool(distractor)))
 
     # ------------------------------------------------------------------
     def track_sequence(self,
@@ -463,6 +588,8 @@ class SAM2AOTMemoryTracker:
         self._trusted_ref = None
         self._ref_ptrs.clear()
         self._drift_low = 0
+        self._reject_run = 0
+        self._pending_fail.clear()
         self._n_promoted = self._n_evicted = 0
         predictor = self._predictor
         state = None
@@ -515,14 +642,41 @@ class SAM2AOTMemoryTracker:
                 state["images"].pop(frame_idx, None)
 
                 res, px = self._result(logit, h, w)
-                self._area_hist.append(px)
+
+                # ---- live distractor rejection (top-K identity vote) ----
+                # A flip onto the other person is a girl-sized mask that disagrees
+                # with the frozen trusted anchors. To avoid dropping the odd hard
+                # pose of the *correct* girl, we only suppress once the vote has
+                # failed for reject_patience CONSECUTIVE frames (a real flip lasts
+                # the whole distractor solo; a hard pose is a brief dip). When it
+                # trips we also retroactively drop that run's earlier frames, so
+                # later frames can't attend to the flip — this is what keeps
+                # contamination REVERSIBLE. Active only once the trusted set is
+                # frozen (early frames bootstrap it).
+                vote, cos5 = self._identity_vote(state, frame_idx)  # telemetry
+                lt_coh = self._lt_coherence(state, frame_idx)
+                fail = (self.distractor_reject
+                        and res.is_visible
+                        and lt_coh is not None
+                        and lt_coh < self.st_audit_tau)
+                if fail:
+                    self._reject_run += 1
+                else:
+                    self._reject_run = 0
+                    self._pending_fail.clear()
+                distractor = fail and self._reject_run >= self.reject_patience
+                if fail and not distractor:
+                    self._pending_fail.append(frame_idx)  # provisional, still tracked
+
+                if not distractor:
+                    self._area_hist.append(px)
 
                 # ---- AOT long/short-term memory management ----
-                size_gate = self._should_promote(frame_idx, px, h * w)
+                size_gate = (not distractor
+                             and self._should_promote(frame_idx, px, h * w))
 
-                # Drift run: count consecutive frames whose identity has fallen
-                # away from the trusted reference (used to freeze promotion when
-                # the track is sustainedly off, e.g. a long distractor solo).
+                # Drift run: consecutive frames whose identity has fallen away from
+                # the trusted reference (freezes promotion during a long solo).
                 cos_ref = self._appearance_cos(state, frame_idx)
                 if cos_ref is not None:
                     self._drift_low = (self._drift_low + 1
@@ -553,9 +707,33 @@ class SAM2AOTMemoryTracker:
                         self._log(f"f{frame_idx}: REJECT promote "
                                   f"(cos={cos_ref if cos_ref is not None else float('nan'):.3f}"
                                   f" < tau={self.appearance_tau}, drift={self._drift_low})")
+
+                # Telemetry BEFORE the suppression pop, while obj_ptr still exists.
                 if self.collect_telemetry:
                     self._record_telemetry(state, frame_idx, res, px,
-                                           size_gate, promoted)
+                                           size_gate, promoted, distractor)
+
+                # Apply distractor suppression: drop the memory write + emit empty.
+                if distractor:
+                    self._suppress_frame(state, frame_idx)
+                    # On the frame the run first trips, retroactively drop the
+                    # earlier frames of this run (they were provisionally kept)
+                    # so the flip never had a foothold in short-term memory.
+                    if self._pending_fail:
+                        for fi in self._pending_fail:
+                            self._suppress_frame(state, fi)
+                        self._log(f"f{frame_idx}: ST-audit trip — evict run "
+                                  f"{self._pending_fail[0]}..{frame_idx} from short-term "
+                                  f"(lt_coh={lt_coh:.3f} < {self.st_audit_tau})")
+                        self._pending_fail.clear()
+                    res, px = TrackResult(None, 0.0, None, False), 0
+
+                # Periodic memory self-consistency audit: sweep outlier anchors
+                # (contaminated frames that slipped past the promotion gate).
+                if (self.audit_memory and frame_idx > 0
+                        and frame_idx % self.audit_gap == 0):
+                    self._audit_memory(state)
+
                 self._evict_short_term(state, frame_idx)
 
                 yield frame_idx, res

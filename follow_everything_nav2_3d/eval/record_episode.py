@@ -4,10 +4,18 @@ Mirrors follow_everything_nav2's results/logs/ep_<ts>_*/{world,leader,follower}.
 layout so we can debug the 3D port the same way as the 2D one.
 
 Usage (inside the container, from /ws):
-    python3 eval/record_episode.py [duration_sec] [detection_source]
+    PERCEPTION=<oracle|aot|sam2_aot_memory> \
+        python3 eval/record_episode.py [duration_sec] [map]
 
-  duration_sec      defaults to 30
-  detection_source  defaults to oracle  (also accepts edgetam)
+  duration_sec  defaults to 30
+  map           defaults to empty
+  PERCEPTION    (env) the single perception-backend selector, default oracle:
+                  oracle          - oracle_camera drives the contract topic;
+                                    NO tracker is spawned (ground truth).
+                  aot             - aot_tracker.py drives it (DeAOT/AOT).
+                  sam2_aot_memory - edgetam_tracker.py drives it, routed to
+                                    sam2_aot_memory.SAM2AOTMemoryStreamingTracker
+                                    (EdgeTAM + AOT long/short-term memory).
 
 Produces:
     results/logs/ep_<unix_ts>_empty_0/
@@ -26,8 +34,24 @@ from pathlib import Path
 
 
 DUR = int(sys.argv[1]) if len(sys.argv) > 1 else 30
-SRC = sys.argv[2] if len(sys.argv) > 2 else "oracle"
-MAP = sys.argv[3] if len(sys.argv) > 3 else "empty"
+MAP = sys.argv[2] if len(sys.argv) > 2 else "empty"
+
+# Single perception-backend selector (replaces the old detection_source
+# positional + TRACKER_KIND env). oracle | aot | sam2_aot_memory.
+PERCEPTION = os.environ.get("PERCEPTION", "oracle").strip()
+_VALID_PERCEPTION = ("oracle", "aot", "sam2_aot_memory")
+# Catch the legacy CLI shape `record_episode.py <dur> <detection_source> <map>`:
+# argv[2] used to be oracle/edgetam, now it's the map. Fail loud with a hint.
+if MAP in ("oracle", "edgetam", "aot", "sam2_aotmem", "sam2_aot_memory"):
+    sys.exit(
+        f"'{MAP}' is not a map. The CLI changed: perception is now the "
+        f"PERCEPTION env var and argv[2] is the map.\n"
+        f"  e.g.  PERCEPTION=aot python3 eval/record_episode.py {DUR} empty")
+if PERCEPTION not in _VALID_PERCEPTION:
+    sys.exit(f"PERCEPTION={PERCEPTION!r} invalid; "
+             f"choose from {_VALID_PERCEPTION}")
+# Whether a tracker process is spawned at all (oracle drives detections itself).
+USE_TRACKER = PERCEPTION in ("aot", "sam2_aot_memory")
 WS  = os.environ.get("WS_ROOT", "/ws")
 TS  = int(time.time())
 DIR = Path(WS) / "results" / "logs" / f"ep_{TS}_{MAP}_0"
@@ -35,7 +59,7 @@ SNAPS = DIR / "snapshots"
 DIR.mkdir(parents=True, exist_ok=True)
 SNAPS.mkdir(parents=True, exist_ok=True)
 
-print(f"Recording {DUR}s map={MAP} detection_source={SRC} -> {DIR}")
+print(f"Recording {DUR}s map={MAP} perception={PERCEPTION} -> {DIR}")
 
 # For non-empty maps, regenerate the world from the 2D map first.
 if MAP == "empty":
@@ -119,7 +143,9 @@ spawn("world", [
 #    perception system races a moving target it hasn't locked onto yet.
 # ---------------------------------------------------------------------------
 oracle_cmd = ["python3", "-u", f"{WS}/sim/python/oracle_camera.py"]
-if SRC == "edgetam":
+if USE_TRACKER:
+    # A tracker drives the contract topic, so keep the oracle on a side
+    # topic (ground-truth logging / projection lookup only).
     oracle_cmd += [
         "--ros-args", "-r",
         "/follower/camera/detections:=/follower/camera/detections_oracle",
@@ -156,88 +182,82 @@ p = subprocess.Popen(
 procs.append(("snapshots", p))
 
 # ---------------------------------------------------------------------------
-# 3) FOLLOWER: EdgeTAM tracker + the BT-based follow_everything_follower.
+# 3) FOLLOWER: perception tracker (unless oracle) + BT follow_everything_follower.
 # ---------------------------------------------------------------------------
-# Tracker selection. TRACKER_KIND env var picks one of:
-#   edgetam      (default) - plain EdgeTAM streaming tracker
-#   sam2_aotmem            - EdgeTAM + AOT long/short-term memory. Same script
-#                            and topic as edgetam; edgetam_tracker.py sees
-#                            SAM2_AOT_MEM=1 (set on the tracker env below) and
-#                            routes to sam2_aot_memory.SAM2AOTMemoryStreamingTracker
-#                            (appearance-gated LT promotion, distractor
-#                            rejection, self-consistency audit).
-#   aot                    - DeAOT/AOT tracker (separate script)
-# All variants share a streaming contract via the topic remap.
-TRACKER_KIND = os.environ.get("TRACKER_KIND", "edgetam")
-sam2_aotmem = False
-if TRACKER_KIND == "aot":
-    tracker_script  = f"{WS}/follower_pkg/python/aot_tracker.py"
-    tracker_topic   = "/follower/camera/detections_aot"
-    INIT_READY_MARKER = "AOT init: mask shape="
-else:
-    # 'edgetam' and 'sam2_aotmem' both run edgetam_tracker.py on the same
-    # topic; the worker logs the same init marker for either. sam2_aotmem
-    # just flips on the AOT memory via SAM2_AOT_MEM=1 (applied to tracker_env).
-    tracker_script  = f"{WS}/follower_pkg/python/edgetam_tracker.py"
-    tracker_topic   = "/follower/camera/detections_edgetam"
-    INIT_READY_MARKER = "EdgeTAM init: mask shape="
-    sam2_aotmem = (TRACKER_KIND == "sam2_aotmem")
+# PERCEPTION picks the backend that drives /follower/camera/detections:
+#   oracle          -> oracle_camera drives it; NO tracker is spawned.
+#   aot             -> aot_tracker.py.
+#   sam2_aot_memory -> edgetam_tracker.py with EDGETAM_TRACKER=sam2_aot_memory,
+#                      routed to sam2_aot_memory.SAM2AOTMemoryStreamingTracker
+#                      (appearance-gated LT promotion, distractor rejection,
+#                      self-consistency audit).
+# BT's taskset cores are read regardless of whether a tracker runs.
+follower_cores = os.environ.get("FOLLOWER_TASKSET_CORES", "").strip()
 
-tracker_cmd = ["python3", "-u", tracker_script]
-if SRC == "edgetam":
-    # SRC name kept for backwards compat — it means "tracker drives the
-    # contract topic." Remap source depends on which tracker is active.
-    tracker_cmd += [
+if USE_TRACKER:
+    if PERCEPTION == "aot":
+        tracker_script    = f"{WS}/follower_pkg/python/aot_tracker.py"
+        tracker_topic     = "/follower/camera/detections_aot"
+        INIT_READY_MARKER = "AOT init: mask shape="
+        edgetam_variant   = None
+    else:  # sam2_aot_memory
+        tracker_script    = f"{WS}/follower_pkg/python/edgetam_tracker.py"
+        tracker_topic     = "/follower/camera/detections_edgetam"
+        INIT_READY_MARKER = "EdgeTAM init: mask shape="
+        edgetam_variant   = "sam2_aot_memory"
+
+    # The selected tracker always drives the contract topic (remap).
+    tracker_cmd = [
+        "python3", "-u", tracker_script,
         "--ros-args", "-r",
         f"{tracker_topic}:=/follower/camera/detections",
     ]
-# CPU pinning. The AOT pure-PyTorch fallback can saturate a CPU core
-# and starve the BT's 20 Hz tick — visible as choppy follow behavior
-# in heavy maps (forest, cluttered). Pin the tracker to a subset of
-# cores via TRACKER_TASKSET_CORES (comma-separated cgroup mask, e.g.
-# "0,1"); the BT picks up the complement via FOLLOWER_TASKSET_CORES.
-# Both default to unpinned (no taskset wrapper) so this only kicks
-# in when explicitly requested. Needs `privileged: true` on compose
-# (already set) for the BT's negative-nice case too.
-tracker_cores  = os.environ.get("TRACKER_TASKSET_CORES",  "").strip()
-follower_cores = os.environ.get("FOLLOWER_TASKSET_CORES", "").strip()
-if tracker_cores:
-    tracker_cmd = ["taskset", "-c", tracker_cores] + tracker_cmd
-    print(f"Pinning tracker to cores {tracker_cores}")
-# Forward the episode log directory so the tracker can dump init RGB +
-# the first few propagated frames for offline inspection.
-tracker_env = dict(os.environ)
-tracker_env["EP_LOG_DIR"] = str(DIR)
-if sam2_aotmem:
-    # Enable EdgeTAM + AOT long/short-term memory (mirrors follower.launch.py).
-    # edgetam_tracker.py routes to SAM2AOTMemoryStreamingTracker; the first
-    # frame pays a one-time torch.compile cost, so init takes longer here.
-    tracker_env["SAM2_AOT_MEM"] = "1"
-    print("TRACKER_KIND=sam2_aotmem -> SAM2_AOT_MEM=1 "
-          "(EdgeTAM + AOT long/short-term memory)")
-spawn("follower", tracker_cmd, env=tracker_env)
+    # CPU pinning. The AOT pure-PyTorch fallback can saturate a CPU core and
+    # starve the BT's 20 Hz tick — choppy follow in heavy maps (forest,
+    # cluttered). Pin the tracker via TRACKER_TASKSET_CORES (e.g. "0,1"); the
+    # BT picks up the complement via FOLLOWER_TASKSET_CORES. Default unpinned.
+    # Needs `privileged: true` on compose (already set) for the BT's nice case.
+    tracker_cores = os.environ.get("TRACKER_TASKSET_CORES", "").strip()
+    if tracker_cores:
+        tracker_cmd = ["taskset", "-c", tracker_cores] + tracker_cmd
+        print(f"Pinning tracker to cores {tracker_cores}")
+    # Forward the episode log dir so the tracker can dump init RGB + the first
+    # few propagated frames for offline inspection.
+    tracker_env = dict(os.environ)
+    tracker_env["EP_LOG_DIR"] = str(DIR)
+    if edgetam_variant:
+        # Name the EdgeTAM-hosted variant explicitly (no on/off boolean).
+        tracker_env["EDGETAM_TRACKER"] = edgetam_variant
+        print(f"PERCEPTION=sam2_aot_memory -> EDGETAM_TRACKER={edgetam_variant} "
+              "(EdgeTAM + AOT long/short-term memory)")
+    spawn("follower", tracker_cmd, env=tracker_env)
 
-# Block until the tracker has both (a) finished building the predictor
-# (~30 s cold for EdgeTAM, ~5 s for AOT; sam2_aotmem adds a one-time
-# torch.compile of the image encoder on the first frame) AND (b) run its
-# first init pass on the stationary leader. The init line only appears once
-# the tracker has received a camera frame + oracle bbox AND processed it.
-# INIT_READY_MARKER is set above based on TRACKER_KIND. No timeout here: a
-# longer compile just makes this wait longer, which is fine.
-print(f"Waiting for tracker init ({INIT_READY_MARKER!r})...")
-_t0 = time.time()
-_follower_log = DIR / "follower.log"
-while True:
-    if _follower_log.exists():
-        with open(_follower_log) as _fh:
-            if INIT_READY_MARKER in _fh.read():
-                break
-    time.sleep(0.5)
-print(f"Tracker ready after {time.time() - _t0:.1f}s. "
-      "Spawning leader_controller + BT.")
+    # Block until the tracker has both (a) finished building the predictor
+    # (~30 s cold for EdgeTAM, ~5 s for AOT; sam2_aot_memory adds a one-time
+    # torch.compile of the image encoder on the first frame) AND (b) run its
+    # first init pass on the stationary leader. The init line only appears once
+    # the tracker got a camera frame + oracle bbox AND processed it. No timeout:
+    # a longer compile just makes this wait longer, which is fine.
+    print(f"Waiting for tracker init ({INIT_READY_MARKER!r})...")
+    _t0 = time.time()
+    _follower_log = DIR / "follower.log"
+    while True:
+        if _follower_log.exists():
+            with open(_follower_log) as _fh:
+                if INIT_READY_MARKER in _fh.read():
+                    break
+        time.sleep(0.5)
+    print(f"Tracker ready after {time.time() - _t0:.1f}s. "
+          "Spawning leader_controller + BT.")
+else:
+    # oracle: oracle_camera drives detections from ground truth — no tracker to
+    # build, so no lock-on window to protect. Give oracle a moment to come up,
+    # then start the leader.
+    print("PERCEPTION=oracle -> no tracker; oracle_camera drives detections.")
+    time.sleep(3)
 
-# Patrol controller for the leader — only spawn AFTER tracker init,
-# otherwise the leader walks away during the build window.
+# Patrol controller for the leader — for tracker modes this is only reached
+# AFTER tracker init, so the leader doesn't walk away during the build window.
 leader_env = dict(os.environ)
 leader_env["EP_MAP"] = MAP
 spawn("leader", [

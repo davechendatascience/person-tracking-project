@@ -8,9 +8,12 @@ add /opt/follow_everything_nav2 to PYTHONPATH (so its `from sim.world …`
 imports resolve), and just exec it.
 
 Toggle:
-  detection_source:=edgetam (default) — EdgeTAM output remapped onto the
-                                        contract topic.
-  detection_source:=oracle            — oracle drives the contract topic.
+  perception:=oracle (default)     — oracle drives the contract topic; no
+                                     tracker is spawned.
+  perception:=aot                  — aot_tracker.py drives it.
+  perception:=sam2_aot_memory      — edgetam_tracker.py drives it, routed to
+                                     sam2_aot_memory.SAM2AOTMemoryStreamingTracker
+                                     (EdgeTAM + AOT long/short-term memory).
 
 Toggle:
   follower_kind:=bt (default) — runs the BT-based follow_everything_follower.
@@ -35,39 +38,45 @@ def _bringup(context, *args, **kwargs):
     simple_follower = os.path.join(
         repo, "follower_pkg", "python", "simple_follower.py")
 
-    detection_source = LaunchConfiguration("detection_source").perform(context)
-    follower_kind    = LaunchConfiguration("follower_kind").perform(context)
-    tracker_kind     = LaunchConfiguration("tracker_kind").perform(context)
-    rviz             = LaunchConfiguration("rviz").perform(context)
+    perception    = LaunchConfiguration("perception").perform(context)
+    follower_kind = LaunchConfiguration("follower_kind").perform(context)
+    rviz          = LaunchConfiguration("rviz").perform(context)
 
-    # Each tracker variant publishes on its own pre-remap topic; the
-    # `detection_source:=edgetam` arg below points that topic at the
-    # BT's contract topic regardless of which tracker is active.
+    # `perception` is the single backend selector for who drives the BT's
+    # contract topic /follower/camera/detections:
+    #   oracle          -> oracle drives it (external node); NO tracker spawned.
+    #   aot             -> aot_tracker.py.
+    #   sam2_aot_memory -> edgetam_tracker.py (the ROS node) with
+    #                      EDGETAM_TRACKER=sam2_aot_memory, which routes its
+    #                      streaming tracker to
+    #                      sam2_aot_memory.SAM2AOTMemoryStreamingTracker (the
+    #                      real AOT long/short-term memory: appearance-gated LT
+    #                      promotion, distractor rejection, self-consistency
+    #                      audit). sam2_aot_memory.py is a library module, not a
+    #                      runnable node, so it is driven through this node —
+    #                      never spawned directly. Bounded LT -> flat per-frame
+    #                      cost, so faster on average than AOT on long runs.
     tracker_env = dict(os.environ)
-    if tracker_kind == "aot":
+    tracker_cmd = None
+    if perception == "aot":
         tracker_script = "aot_tracker.py"
         tracker_topic  = "/follower/camera/detections_aot"
-    elif tracker_kind == "sam2_aotmem":
-        # Same ROS node + topic as plain edgetam: edgetam_tracker.py owns the
-        # camera I/O, worker thread and projection/publish. SAM2_AOT_MEM=1 makes
-        # its _build_edgetam_streaming_tracker route to
-        # sam2_aot_memory.SAM2AOTMemoryStreamingTracker (the real AOT
-        # long/short-term memory: appearance-gated LT promotion, distractor
-        # rejection, self-consistency audit) instead of the plain EdgeTAM
-        # wrapper. sam2_aot_memory.py is a library module, not a runnable node,
-        # so it's driven through this node — not spawned directly. Bounded LT →
-        # flat per-frame cost, so faster on average than AOT on long runs.
+    elif perception == "sam2_aot_memory":
         tracker_script = "edgetam_tracker.py"
         tracker_topic  = "/follower/camera/detections_edgetam"
-        tracker_env["SAM2_AOT_MEM"] = "1"
+        tracker_env["EDGETAM_TRACKER"] = "sam2_aot_memory"
+    elif perception == "oracle":
+        tracker_script = None   # oracle drives the contract topic directly
     else:
-        tracker_script = "edgetam_tracker.py"
-        tracker_topic  = "/follower/camera/detections_edgetam"
-    tracker = os.path.join(repo, "follower_pkg", "python", tracker_script)
+        raise RuntimeError(
+            f"perception={perception!r} invalid; "
+            "choose oracle | aot | sam2_aot_memory")
 
-    tracker_cmd = [sys.executable, "-u", tracker]
-    if detection_source == "edgetam":
-        tracker_cmd += [
+    if tracker_script is not None:
+        tracker = os.path.join(repo, "follower_pkg", "python", tracker_script)
+        # The selected tracker always drives the contract topic (remap).
+        tracker_cmd = [
+            sys.executable, "-u", tracker,
             "--ros-args", "-r",
             f"{tracker_topic}:=/follower/camera/detections",
         ]
@@ -91,15 +100,15 @@ def _bringup(context, *args, **kwargs):
     follower_env["PYTHONPATH"] = (
         "/opt/follow_everything_nav2:" + fenv_pp).rstrip(":")
 
-    procs = [
-        ExecuteProcess(
+    procs = []
+    if tracker_cmd is not None:  # oracle mode spawns no tracker
+        procs.append(ExecuteProcess(
             cmd=tracker_cmd, env=tracker_env,
-            output="both", cwd=repo, emulate_tty=True),
-        ExecuteProcess(
-            cmd=follower_cmd,
-            env=follower_env,
-            output="both", cwd=repo, emulate_tty=True),
-    ]
+            output="both", cwd=repo, emulate_tty=True))
+    procs.append(ExecuteProcess(
+        cmd=follower_cmd,
+        env=follower_env,
+        output="both", cwd=repo, emulate_tty=True))
 
     # Optional RViz with the EdgeTAM/SAM2-AOTmem overlay preconfigured.
     # The shipped config has an Image display on the overlay topic with
@@ -118,16 +127,12 @@ def _bringup(context, *args, **kwargs):
 def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
-            "detection_source",
-            default_value="edgetam",
-            description="edgetam (tracker drives the contract topic) | "
-                        "oracle (oracle drives it directly)"),
-        DeclareLaunchArgument(
-            "tracker_kind",
-            default_value="edgetam",
-            description="edgetam (SAM2 fork, default) | "
+            "perception",
+            default_value="oracle",
+            description="perception backend that drives the contract topic: "
+                        "oracle (ground truth, no tracker) | "
                         "aot (AOT/DeAOT family, occlusion-robust memory) | "
-                        "sam2_aotmem (EdgeTAM + AOT long/short-term memory)"),
+                        "sam2_aot_memory (EdgeTAM + AOT long/short-term memory)"),
         DeclareLaunchArgument(
             "follower_kind",
             default_value="bt",

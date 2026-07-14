@@ -743,8 +743,9 @@ class EdgeTAMTracker(Node):
     # EdgeTAM helpers — kept as instance methods so they're easy to test.
     # ------------------------------------------------------------------
     def _build_sam2_aotmem_tracker(self, log):
-        """tracker_kind:=sam2_aotmem — build the full AOT long/short-term
-        memory tracker from follower_pkg/python/sam2_aot_memory.py and return
+        """PERCEPTION=sam2_aot_memory (EDGETAM_TRACKER=sam2_aot_memory) — build
+        the full AOT long/short-term memory tracker from
+        follower_pkg/python/sam2_aot_memory.py and return
         its streaming adapter (same .initialize()/.track()/.inference_state API
         the worker uses). This module owns the predictor build, torch.compile
         and bf16 autocast, so we do NOT build the plain EdgeTAM predictor for
@@ -803,14 +804,16 @@ class EdgeTAMTracker(Node):
         import torch
         import torch.nn.functional as F
 
-        # tracker_kind:=sam2_aotmem (launch sets SAM2_AOT_MEM=1) → drive the
-        # full AOT long/short-term memory tracker from sam2_aot_memory.py
-        # instead of this file's plain EdgeTAM wrapper. That module owns the
-        # predictor build, torch.compile, bf16 autocast and all memory
-        # management (appearance-gated LT promotion, distractor rejection,
-        # self-consistency audit) — the real thing, replacing the size-only
-        # inline copy this file used to carry.
-        if os.environ.get("SAM2_AOT_MEM", "0") == "1":
+        # Which streaming tracker this node hosts. EDGETAM_TRACKER names it
+        # explicitly (set by record_episode.py / follower.launch.py from the
+        # PERCEPTION selector):
+        #   sam2_aot_memory -> the full AOT long/short-term memory tracker in
+        #       sam2_aot_memory.py (appearance-gated LT promotion, distractor
+        #       rejection, self-consistency audit) — that module owns the
+        #       predictor build, torch.compile and bf16 autocast.
+        #   edgetam (default) -> this file's plain EdgeTAM wrapper below.
+        edgetam_variant = os.environ.get("EDGETAM_TRACKER", "edgetam")
+        if edgetam_variant == "sam2_aot_memory":
             return self._build_sam2_aotmem_tracker(log)
 
         # Insert EdgeTAM's repo on sys.path so `from sam2 ...` resolves
@@ -893,10 +896,11 @@ class EdgeTAMTracker(Node):
                 # (encoder + memory attention + decoder). None -> eager fp32.
                 self._amp_dtype = amp_dtype
                 self._device = device
-                # NOTE: tracker_kind:=sam2_aotmem no longer runs through this
+                # NOTE: PERCEPTION=sam2_aot_memory no longer runs through this
                 # wrapper — _build_edgetam_streaming_tracker short-circuits to
                 # sam2_aot_memory.SAM2AOTMemoryStreamingTracker when
-                # SAM2_AOT_MEM=1. This class is now the plain EdgeTAM path only.
+                # EDGETAM_TRACKER=sam2_aot_memory. This class is the plain
+                # EdgeTAM path only.
 
             def _autocast(self):
                 """bf16 autocast over the forward pass; nullcontext in eager/CPU."""

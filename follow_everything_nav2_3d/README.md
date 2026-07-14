@@ -324,10 +324,10 @@ docker commit follow_everything_nav2_3d follow_everything_nav2_3d:latest
 source /opt/ros/humble/setup.bash
 
 # 60 秒 AOT/DeAOT 跑 forest 地圖
-TRACKER_KIND=aot python3 eval/record_episode.py 60 edgetam forest
+PERCEPTION=aot python3 eval/record_episode.py 60 forest
 ```
 
-說明：第二個 positional 參數 `edgetam` 是 legacy 名稱、意思是「**追蹤器**負責發布 contract topic」，**不是**指定哪一個追蹤器二進位；追蹤器選擇來自 `TRACKER_KIND` 環境變數。
+說明：感知後端由單一 `PERCEPTION` 環境變數選擇（`oracle` | `aot` | `sam2_aot_memory`），預設 `oracle`。positional 參數現在是 `[duration_sec] [map]`（不再有 `detection_source`）。`PERCEPTION=oracle` 時不會啟動任何追蹤器，由 `oracle_camera` 直接發布 contract topic。
 
 正常啟動會看到 follower log 中：
 
@@ -346,10 +346,10 @@ AOT init: mask shape=(480, 640) px=...
 
 ```bash
 # 用較大的 SwinB-DeAOTL（accuracy 較高，VRAM 較吃）
-TRACKER_KIND=aot \
+PERCEPTION=aot \
 AOT_MODEL=swinb_deaotl \
 AOT_CKPT=/opt/aot-benchmark/pretrain_models/SwinB_DeAOTL_PRE_YTB_DAV.pth \
-  python3 eval/record_episode.py 120 edgetam cluttered
+  python3 eval/record_episode.py 120 cluttered
 ```
 
 AOT 環境變數（皆可選，列出預設值；皆於 1001 幀測試影片上驗證過：穩定 5.8 GB VRAM、最終碎片率 2.1%、無 OOM）：
@@ -375,33 +375,34 @@ AOT 環境變數（皆可選，列出預設值；皆於 1001 幀測試影片上�
 啟動順序：
 1. **WORLD**：gz Fortress + 三個 ros_gz_bridge + `world_odom_publisher` + `lidar_leader_filter` + `snapshot_recorder`
 2. **LEADER**：`oracle_camera`
-3. **追蹤器**：依 `TRACKER_KIND` 啟動 `edgetam_tracker.py` 或 `aot_tracker.py`
-4. **阻塞等待**：偵測 follower.log 中出現 `AOT init: mask shape=` 或 `EdgeTAM init: mask shape=` 才繼續，避免追蹤器尚未鎖定就被 leader 走掉
+3. **追蹤器**：依 `PERCEPTION` 啟動 `aot_tracker.py`（`aot`）或 `edgetam_tracker.py`（`sam2_aot_memory`，帶 `EDGETAM_TRACKER=sam2_aot_memory`）。`PERCEPTION=oracle` 時**不啟動追蹤器**，由 oracle 直接發布 detections
+4. **阻塞等待**：追蹤器模式下偵測 follower.log 中出現 `AOT init: mask shape=` 或 `EdgeTAM init: mask shape=` 才繼續，避免追蹤器尚未鎖定就被 leader 走掉；`oracle` 模式無此等待
 5. **LEADER patrol**：`leader_controller.py`（A* random-goal patrol）
 6. **FOLLOWER**：2D 專案掛載過來的 BT-based `follow_everything_follower.py`
 7. 跑 `duration_sec` 秒後送 SIGINT、SIGTERM 收掉所有 process group
 
 ```bash
-python3 eval/record_episode.py [duration_sec] [detection_source] [map]
+PERCEPTION=<oracle|aot|sam2_aot_memory> \
+  python3 eval/record_episode.py [duration_sec] [map]
 ```
 
-| 參數                | 可能值                                  | 預設     |
+| 參數 / 變數         | 可能值                                  | 預設     |
 |--------------------|-----------------------------------------|----------|
 | `duration_sec`     | 整數秒                                   | `30`     |
-| `detection_source` | `oracle` \| `edgetam`                   | `oracle` |
 | `map`              | `empty` \| `cluttered` \| `corridor` \| `forest` | `empty`  |
+| `PERCEPTION`（env） | `oracle`（ground truth，不啟動追蹤器）\| `aot` \| `sam2_aot_memory` | `oracle` |
 
 範例：
 
 ```bash
-# 90 秒 oracle 跑 empty 地圖（baseline / 對照組）
-python3 eval/record_episode.py 90 oracle empty
+# 90 秒 oracle 跑 empty 地圖（baseline / 對照組；不啟動追蹤器）
+PERCEPTION=oracle python3 eval/record_episode.py 90 empty
 
-# 90 秒 EdgeTAM 真實感知跑 cluttered 地圖
-python3 eval/record_episode.py 90 edgetam cluttered
+# 90 秒 SAM2+AOT-memory 真實感知跑 cluttered 地圖
+PERCEPTION=sam2_aot_memory python3 eval/record_episode.py 90 cluttered
 
 # 60 秒 AOT 真實感知跑 forest 地圖（最考驗追蹤器的場景）
-TRACKER_KIND=aot python3 eval/record_episode.py 60 edgetam forest
+PERCEPTION=aot python3 eval/record_episode.py 60 forest
 ```
 
 輸出結構：
@@ -420,7 +421,7 @@ results/logs/ep_<ts>_<map>_0/
 ```bash
 docker exec follow_everything_nav2_3d bash -lc \
   'source /opt/ros/humble/setup.bash && cd /ws && \
-   TRACKER_KIND=aot python3 eval/record_episode.py 60 edgetam forest'
+   PERCEPTION=aot python3 eval/record_episode.py 60 forest'
 ```
 
 ---

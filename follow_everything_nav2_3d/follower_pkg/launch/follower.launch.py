@@ -48,9 +48,15 @@ def _bringup(context, *args, **kwargs):
         tracker_script = "aot_tracker.py"
         tracker_topic  = "/follower/camera/detections_aot"
     elif tracker_kind == "sam2_aotmem":
-        # Same EdgeTAM node + topic, with the AOT long/short-term memory
-        # promotion enabled (frozen SAM2 fork + AOT memory). Flat per-frame
-        # cost (bounded LT), so faster on average than AOT on long runs.
+        # Same ROS node + topic as plain edgetam: edgetam_tracker.py owns the
+        # camera I/O, worker thread and projection/publish. SAM2_AOT_MEM=1 makes
+        # its _build_edgetam_streaming_tracker route to
+        # sam2_aot_memory.SAM2AOTMemoryStreamingTracker (the real AOT
+        # long/short-term memory: appearance-gated LT promotion, distractor
+        # rejection, self-consistency audit) instead of the plain EdgeTAM
+        # wrapper. sam2_aot_memory.py is a library module, not a runnable node,
+        # so it's driven through this node — not spawned directly. Bounded LT →
+        # flat per-frame cost, so faster on average than AOT on long runs.
         tracker_script = "edgetam_tracker.py"
         tracker_topic  = "/follower/camera/detections_edgetam"
         tracker_env["SAM2_AOT_MEM"] = "1"

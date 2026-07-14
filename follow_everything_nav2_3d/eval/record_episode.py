@@ -158,17 +158,30 @@ procs.append(("snapshots", p))
 # ---------------------------------------------------------------------------
 # 3) FOLLOWER: EdgeTAM tracker + the BT-based follow_everything_follower.
 # ---------------------------------------------------------------------------
-# Tracker selection. TRACKER_KIND env var picks edgetam (default)
-# or aot; the two scripts share a streaming contract via remap.
+# Tracker selection. TRACKER_KIND env var picks one of:
+#   edgetam      (default) - plain EdgeTAM streaming tracker
+#   sam2_aotmem            - EdgeTAM + AOT long/short-term memory. Same script
+#                            and topic as edgetam; edgetam_tracker.py sees
+#                            SAM2_AOT_MEM=1 (set on the tracker env below) and
+#                            routes to sam2_aot_memory.SAM2AOTMemoryStreamingTracker
+#                            (appearance-gated LT promotion, distractor
+#                            rejection, self-consistency audit).
+#   aot                    - DeAOT/AOT tracker (separate script)
+# All variants share a streaming contract via the topic remap.
 TRACKER_KIND = os.environ.get("TRACKER_KIND", "edgetam")
+sam2_aotmem = False
 if TRACKER_KIND == "aot":
     tracker_script  = f"{WS}/follower_pkg/python/aot_tracker.py"
     tracker_topic   = "/follower/camera/detections_aot"
     INIT_READY_MARKER = "AOT init: mask shape="
 else:
+    # 'edgetam' and 'sam2_aotmem' both run edgetam_tracker.py on the same
+    # topic; the worker logs the same init marker for either. sam2_aotmem
+    # just flips on the AOT memory via SAM2_AOT_MEM=1 (applied to tracker_env).
     tracker_script  = f"{WS}/follower_pkg/python/edgetam_tracker.py"
     tracker_topic   = "/follower/camera/detections_edgetam"
     INIT_READY_MARKER = "EdgeTAM init: mask shape="
+    sam2_aotmem = (TRACKER_KIND == "sam2_aotmem")
 
 tracker_cmd = ["python3", "-u", tracker_script]
 if SRC == "edgetam":
@@ -195,13 +208,22 @@ if tracker_cores:
 # the first few propagated frames for offline inspection.
 tracker_env = dict(os.environ)
 tracker_env["EP_LOG_DIR"] = str(DIR)
+if sam2_aotmem:
+    # Enable EdgeTAM + AOT long/short-term memory (mirrors follower.launch.py).
+    # edgetam_tracker.py routes to SAM2AOTMemoryStreamingTracker; the first
+    # frame pays a one-time torch.compile cost, so init takes longer here.
+    tracker_env["SAM2_AOT_MEM"] = "1"
+    print("TRACKER_KIND=sam2_aotmem -> SAM2_AOT_MEM=1 "
+          "(EdgeTAM + AOT long/short-term memory)")
 spawn("follower", tracker_cmd, env=tracker_env)
 
 # Block until the tracker has both (a) finished building the predictor
-# (~30 s cold for EdgeTAM, ~5 s for AOT) AND (b) run its first init
-# pass on the stationary leader. The init line only appears once the
-# tracker has received a camera frame + oracle bbox AND processed it.
-# INIT_READY_MARKER is set above based on TRACKER_KIND.
+# (~30 s cold for EdgeTAM, ~5 s for AOT; sam2_aotmem adds a one-time
+# torch.compile of the image encoder on the first frame) AND (b) run its
+# first init pass on the stationary leader. The init line only appears once
+# the tracker has received a camera frame + oracle bbox AND processed it.
+# INIT_READY_MARKER is set above based on TRACKER_KIND. No timeout here: a
+# longer compile just makes this wait longer, which is fine.
 print(f"Waiting for tracker init ({INIT_READY_MARKER!r})...")
 _t0 = time.time()
 _follower_log = DIR / "follower.log"

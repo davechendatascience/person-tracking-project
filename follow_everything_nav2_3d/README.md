@@ -405,6 +405,8 @@ PERCEPTION=sam2_aot_memory python3 eval/record_episode.py 90 cluttered
 PERCEPTION=aot python3 eval/record_episode.py 60 forest
 ```
 
+> `sam2_aot_memory` 的 backbone 預設為 **`sam2-tiny`**（SAM2.1 Hiera-Tiny，checkpoint bind-mount 於 `/opt/sam2.1_hiera_tiny.pt`）。可用 `SAM2_AOT_BACKBONE` 覆寫：`sam2-tiny` | `sam2-small` | `sam2-large`（皆已於 docker-compose 掛載）| `edgetam`（EdgeTAM fork）。
+
 輸出結構：
 
 ```

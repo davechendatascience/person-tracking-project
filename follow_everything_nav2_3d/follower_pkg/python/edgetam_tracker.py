@@ -751,17 +751,19 @@ class EdgeTAMTracker(Node):
         and bf16 autocast, so we do NOT build the plain EdgeTAM predictor for
         this path.
 
-        In the sim container the module resolves EdgeTAM at /opt/EdgeTAM; we
-        also pass the container's edgetam cfg+checkpoint explicitly so it never
-        depends on host-relative paths. Backbone defaults to 'edgetam' (the
-        only checkpoint mounted into the container); override with
-        SAM2_AOT_BACKBONE if the sam2.1 Hiera weights are available."""
+        Backbone defaults to 'sam2-tiny' (SAM2.1 Hiera-Tiny). Its cfg
+        (configs/sam2.1/sam2.1_hiera_t.yaml) resolves via EdgeTAM's sam2 package
+        on sys.path; its checkpoint is bind-mounted at /opt/sam2.1_hiera_tiny.pt
+        (see docker-compose.yml). Override with SAM2_AOT_BACKBONE
+        (sam2-tiny|sam2-small|sam2-large|edgetam); 'edgetam' uses the EdgeTAM
+        cfg+checkpoint at /opt/EdgeTAM. In every case we pin the container
+        checkpoint path explicitly so it never depends on host-relative paths."""
         import os
         # Same-dir import of the copied module.
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from sam2_aot_memory import SAM2AOTMemoryStreamingTracker
 
-        backbone = os.environ.get("SAM2_AOT_BACKBONE", "edgetam")
+        backbone = os.environ.get("SAM2_AOT_BACKBONE", "sam2-tiny")
         eager = os.environ.get("SAM2_AOT_EAGER", "0") == "1"
         kwargs = dict(
             backbone=backbone,
@@ -776,10 +778,20 @@ class EdgeTAMTracker(Node):
             min_area_ratio=PERCEPTION_CFG["min_mask_area_ratio"],
             keep_behind=int(os.environ.get("SAM2_AOT_KEEP_BEHIND", "24")),
         )
+        # Pin the container checkpoint path explicitly (never host-relative).
+        # The sam2.1 Hiera cfgs live in EdgeTAM's sam2 package; the checkpoints
+        # are bind-mounted under /opt (docker-compose.yml).
+        _SAM2_CKPTS = {
+            "sam2-tiny":  "/opt/sam2.1_hiera_tiny.pt",
+            "sam2-small": "/opt/sam2.1_hiera_small.pt",
+            "sam2-large": "/opt/sam2.1_hiera_large.pt",
+        }
         if backbone == "edgetam":
-            # Pin to the container's EdgeTAM cfg + checkpoint (bind-mounted).
             kwargs["model_cfg"] = SAM2_CFG["model_cfg"]
             kwargs["checkpoint"] = SAM2_CFG["checkpoint"]
+        elif backbone in _SAM2_CKPTS and os.path.exists(_SAM2_CKPTS[backbone]):
+            # cfg comes from the module's _BACKBONES entry; pin the checkpoint.
+            kwargs["checkpoint"] = _SAM2_CKPTS[backbone]
         log.info(
             f"sam2-aotmem: building full AOT-memory tracker "
             f"(backbone={backbone}, amp={kwargs['amp']}, "

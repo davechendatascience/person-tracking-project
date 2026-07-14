@@ -60,6 +60,13 @@ services:
       # ImageNet backbones via torch.hub on first run).
       - ~/.cache/torch:/root/.cache/torch
       - ../yolo11m.pt:/opt/yolo11m.pt:ro
+      # SAM2.1 Hiera checkpoints for PERCEPTION=sam2_aot_memory. The tracker
+      # (edgetam_tracker._build_sam2_aotmem_tracker) defaults to sam2-tiny and
+      # pins these /opt paths; the cfgs ship inside EdgeTAM's sam2 package.
+      # Override the backbone with SAM2_AOT_BACKBONE (sam2-tiny|small|large|edgetam).
+      - ../sam2.1_hiera_tiny.pt:/opt/sam2.1_hiera_tiny.pt:ro
+      - ../sam2.1_hiera_small.pt:/opt/sam2.1_hiera_small.pt:ro
+      - ../sam2.1_hiera_large.pt:/opt/sam2.1_hiera_large.pt:ro
     working_dir: /ws
     stdin_open: true
     tty: true

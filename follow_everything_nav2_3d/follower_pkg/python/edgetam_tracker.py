@@ -742,6 +742,50 @@ class EdgeTAMTracker(Node):
     # ------------------------------------------------------------------
     # EdgeTAM helpers — kept as instance methods so they're easy to test.
     # ------------------------------------------------------------------
+    def _build_sam2_aotmem_tracker(self, log):
+        """tracker_kind:=sam2_aotmem — build the full AOT long/short-term
+        memory tracker from follower_pkg/python/sam2_aot_memory.py and return
+        its streaming adapter (same .initialize()/.track()/.inference_state API
+        the worker uses). This module owns the predictor build, torch.compile
+        and bf16 autocast, so we do NOT build the plain EdgeTAM predictor for
+        this path.
+
+        In the sim container the module resolves EdgeTAM at /opt/EdgeTAM; we
+        also pass the container's edgetam cfg+checkpoint explicitly so it never
+        depends on host-relative paths. Backbone defaults to 'edgetam' (the
+        only checkpoint mounted into the container); override with
+        SAM2_AOT_BACKBONE if the sam2.1 Hiera weights are available."""
+        import os
+        # Same-dir import of the copied module.
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from sam2_aot_memory import SAM2AOTMemoryStreamingTracker
+
+        backbone = os.environ.get("SAM2_AOT_BACKBONE", "edgetam")
+        eager = os.environ.get("SAM2_AOT_EAGER", "0") == "1"
+        kwargs = dict(
+            backbone=backbone,
+            device=SAM2_CFG["device"],
+            image_size=SAM2_CFG["image_size"],
+            amp=os.environ.get("SAM2_AOT_AMP", "bf16"),
+            compile_encoder=(not eager),
+            mem_gap=int(os.environ.get("SAM2_AOT_MEM_GAP", "10")),
+            lt_max=int(os.environ.get("SAM2_AOT_MEM_LT_MAX", "6")),
+            promote_area_lo=float(os.environ.get("SAM2_AOT_MEM_AREA_LO", "0.6")),
+            promote_area_hi=float(os.environ.get("SAM2_AOT_MEM_AREA_HI", "1.6")),
+            min_area_ratio=PERCEPTION_CFG["min_mask_area_ratio"],
+            keep_behind=int(os.environ.get("SAM2_AOT_KEEP_BEHIND", "24")),
+        )
+        if backbone == "edgetam":
+            # Pin to the container's EdgeTAM cfg + checkpoint (bind-mounted).
+            kwargs["model_cfg"] = SAM2_CFG["model_cfg"]
+            kwargs["checkpoint"] = SAM2_CFG["checkpoint"]
+        log.info(
+            f"sam2-aotmem: building full AOT-memory tracker "
+            f"(backbone={backbone}, amp={kwargs['amp']}, "
+            f"compile={kwargs['compile_encoder']}, "
+            f"mem_gap={kwargs['mem_gap']}, lt_max={kwargs['lt_max']})")
+        return SAM2AOTMemoryStreamingTracker(**kwargs)
+
     def _build_edgetam_streaming_tracker(self, log):
         """Build EdgeTAM's video predictor and wrap it in a streaming
         tracker that exposes the same .initialize / .track API the rest
@@ -758,6 +802,16 @@ class EdgeTAMTracker(Node):
         from collections import OrderedDict
         import torch
         import torch.nn.functional as F
+
+        # tracker_kind:=sam2_aotmem (launch sets SAM2_AOT_MEM=1) → drive the
+        # full AOT long/short-term memory tracker from sam2_aot_memory.py
+        # instead of this file's plain EdgeTAM wrapper. That module owns the
+        # predictor build, torch.compile, bf16 autocast and all memory
+        # management (appearance-gated LT promotion, distractor rejection,
+        # self-consistency audit) — the real thing, replacing the size-only
+        # inline copy this file used to carry.
+        if os.environ.get("SAM2_AOT_MEM", "0") == "1":
+            return self._build_sam2_aotmem_tracker(log)
 
         # Insert EdgeTAM's repo on sys.path so `from sam2 ...` resolves
         # to EdgeTAM's fork (it ships its own `sam2/` directory).
@@ -839,25 +893,10 @@ class EdgeTAMTracker(Node):
                 # (encoder + memory attention + decoder). None -> eager fp32.
                 self._amp_dtype = amp_dtype
                 self._device = device
-                # --- AOT long/short-term memory (sam2-aotmem) ---
-                # Promote confident, size-stable propagated frames into
-                # cond_frame_outputs (SAM2's always-attended long-term tier),
-                # bounded by FIFO eviction (frame 0 protected). Off by default —
-                # the follower launch sets SAM2_AOT_MEM=1 for
-                # tracker_kind:=sam2_aotmem; with it off EdgeTAM is unchanged.
-                import os as _os
-                self._mem = _os.environ.get("SAM2_AOT_MEM", "0") == "1"
-                self._mem_gap = int(_os.environ.get("SAM2_AOT_MEM_GAP", "10"))
-                self._mem_lt_max = int(_os.environ.get("SAM2_AOT_MEM_LT_MAX", "6"))
-                self._mem_lo = float(_os.environ.get("SAM2_AOT_MEM_AREA_LO", "0.6"))
-                self._mem_hi = float(_os.environ.get("SAM2_AOT_MEM_AREA_HI", "1.6"))
-                self._mem_promoted = []
-                self._mem_area_hist = []
-                self._mem_n = 0
-                if self._mem:
-                    print(f"[sam2-aotmem] AOT memory ON "
-                          f"(gap={self._mem_gap}, lt_max={self._mem_lt_max})",
-                          flush=True)
+                # NOTE: tracker_kind:=sam2_aotmem no longer runs through this
+                # wrapper — _build_edgetam_streaming_tracker short-circuits to
+                # sam2_aot_memory.SAM2AOTMemoryStreamingTracker when
+                # SAM2_AOT_MEM=1. This class is now the plain EdgeTAM path only.
 
             def _autocast(self):
                 """bf16 autocast over the forward pass; nullcontext in eager/CPU."""
@@ -973,53 +1012,7 @@ class EdgeTAMTracker(Node):
                 if m is None:
                     m = np.zeros(
                         (self.img_height, self.img_width), dtype=np.uint8)
-                # AOT long-term memory promotion (sam2-aotmem). Runs before the
-                # worker's short-term eviction, so a promoted frame is already in
-                # cond and won't be dropped by the non_cond eviction.
-                if self._mem and not init:
-                    px = int(m.sum())
-                    self._mem_area_hist.append(px)
-                    if self._mem_should_promote(self.frame_index, px):
-                        self._mem_promote(self.frame_index)
                 return {"pred_mask": m}
-
-            def _mem_should_promote(self, idx, px):
-                """DMAOT-style gate: periodic, non-empty, size-stable."""
-                if (not self._mem or idx == 0 or self._mem_gap <= 0
-                        or idx % self._mem_gap != 0 or px < 50):
-                    return False
-                if self._mem_area_hist:
-                    med = float(np.median(self._mem_area_hist[-10:]))
-                    if med > 0 and not (
-                            self._mem_lo * med <= px <= self._mem_hi * med):
-                        return False  # size jump -> likely drift/distractor
-                return True
-
-            def _mem_promote(self, idx):
-                """Move propagated frame idx non_cond -> cond (always-attended
-                long-term anchor), then FIFO-evict beyond lt_max. Frame 0 is
-                never in _mem_promoted, so it is never evicted (SAM2's preflight
-                requires the prompt frame to stay in cond)."""
-                od = self.inference_state["output_dict"]
-                if idx not in od["non_cond_frame_outputs"]:
-                    return
-                od["cond_frame_outputs"][idx] = \
-                    od["non_cond_frame_outputs"].pop(idx)
-                for obj in self.inference_state["output_dict_per_obj"].values():
-                    if idx in obj["non_cond_frame_outputs"]:
-                        obj["cond_frame_outputs"][idx] = \
-                            obj["non_cond_frame_outputs"].pop(idx)
-                self._mem_promoted.append(idx)
-                self._mem_n += 1
-                while len(self._mem_promoted) > self._mem_lt_max:
-                    v = self._mem_promoted.pop(0)
-                    od["cond_frame_outputs"].pop(v, None)
-                    for obj in self.inference_state["output_dict_per_obj"].values():
-                        obj["cond_frame_outputs"].pop(v, None)
-                print(f"[sam2-aotmem] promote f{idx} -> LT "
-                      f"({len(self._mem_promoted)}/{self._mem_lt_max}, "
-                      f"px={self._mem_area_hist[-1]}, total={self._mem_n})",
-                      flush=True)
 
         return _EdgeTAMStreamingTracker()
 

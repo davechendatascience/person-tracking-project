@@ -131,12 +131,14 @@ class SAM2AOTMemoryTracker:
                        _PROJECT_ROOT / "sam2.1_hiera_large.pt"),
         "sam2-small": ("configs/sam2.1/sam2.1_hiera_s.yaml",
                        _PROJECT_ROOT / "sam2.1_hiera_small.pt"),
+        "sam2-tiny": ("configs/sam2.1/sam2.1_hiera_t.yaml", 
+                        _PROJECT_ROOT / "sam2.1_hiera_tiny.pt"),
         "edgetam":    ("configs/edgetam.yaml",
                        _EDGETAM_DIR / "checkpoints" / "edgetam.pt"),
     }
 
     def __init__(self,
-                 backbone: str = "sam2-small",
+                 backbone: str = "sam2-tiny",
                  model_cfg: Optional[str] = None,
                  checkpoint: Optional[str] = None,
                  device: str = "cuda",
